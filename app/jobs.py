@@ -86,8 +86,10 @@ class JobRunner:
         self._executor.submit(self._run, job, lambda: self._encode(job, prompt, token))
         return job
 
-    def submit_generate(self, prompt: str, res: Resolution, seed: int, lora_stack: list[dict] | None = None) -> Job:
-        """`lora_stack` is a snapshot of the stack at submit time (later edits apply to the next image)."""
+    def submit_generate(self, prompt: str, res: Resolution, seed: int, lora_stack: list[dict] | None = None,
+                        extra_meta: dict | None = None) -> Job:
+        """`lora_stack` is a snapshot of the stack at submit time (later edits apply to the next image).
+        `extra_meta` (e.g. the active character) is recorded in the request and the image metadata."""
         cond = self.cache.valid_for(prompt, self.manager.text_encoder_fingerprint())
         if cond is None:
             raise ValueError("The current prompt has not been encoded with the current text encoder. Click Encode Prompt first.")
@@ -98,10 +100,11 @@ class JobRunner:
             if not info.compatible:
                 raise ValueError(f"LoRA {info.filename}: " + "; ".join(info.problems))
         job = Job(kind="generate", request={"prompt": prompt, "width": res.width, "height": res.height, "seed": seed, "conditioning_id": cond.id,
-                                            "loras": [{"file": self.loras.inspect(e["path"]).filename, "strength": e.get("strength", 1.0)} for e in active]})
+                                            "loras": [{"file": self.loras.inspect(e["path"]).filename, "strength": e.get("strength", 1.0)} for e in active],
+                                            **(extra_meta or {})})
         self._claim(job)
         keep = [e["path"] for e in stack]
-        self._executor.submit(self._run, job, lambda: self._generate(job, cond, res, seed, active, keep))
+        self._executor.submit(self._run, job, lambda: self._generate(job, cond, res, seed, active, keep, extra_meta))
         return job
 
     def run_on_worker(self, fn: Callable[[], object]) -> object:
@@ -187,7 +190,8 @@ class JobRunner:
         job.result = {"conditioning": cond.describe(), "seconds": round(time.time() - job.started, 2)}
         job.set_stage("Ready to generate")
 
-    def _generate(self, job: Job, cond, res: Resolution, seed: int, loras: list[dict] | None = None, keep: list[str] | None = None) -> None:
+    def _generate(self, job: Job, cond, res: Resolution, seed: int, loras: list[dict] | None = None, keep: list[str] | None = None,
+                  extra_meta: dict | None = None) -> None:
         t0 = time.time()
 
         def progress(i: int, n: int) -> None:
@@ -229,6 +233,7 @@ class JobRunner:
             "streamed_blocks": len(plan.get("streamed_blocks") or []),
             "vae_decode": decode_info["mode"],
             "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            **(extra_meta or {}),
         }
         image_id, _ = save_image(image, meta)
         notes = [s.note for s in self.manager.status.values() if getattr(s, "note", "") and "exceeded" in s.note]

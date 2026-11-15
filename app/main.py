@@ -14,7 +14,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import checkpoints as ck
+from . import config as cfg
 from . import resolution as resmod
+from .characters import CharacterError, CharacterStore, Duplicate, NotFound, compose_prompt
 from .conditioning import PromptCache
 from .config import LORA_DIR, MAX_LORAS, MAX_SEED, Settings, SettingsError, load_settings, save_settings, update_settings, validate_models
 from .jobs import Busy, JobRunner, new_random_seed
@@ -34,6 +36,9 @@ class State:
     cache: PromptCache
     monitor: Monitor
     loras: LoraLibrary
+    characters: CharacterStore | None = None
+    # None = landing page; {"character_id": int | None} = generation workspace (None id = no character)
+    workspace: dict | None = None
     startup_error: str | None = None
 
 
@@ -55,6 +60,13 @@ async def lifespan(app: FastAPI):
     S.cache = PromptCache()
     S.monitor = Monitor()
     S.loras = LoraLibrary()
+    S.workspace = None
+    try:
+        S.characters = CharacterStore(cfg.DB_FILE)
+    except Exception as e:  # noqa: BLE001 - a broken DB must not take down generation
+        S.characters = None
+        S.startup_error = f"Character database unavailable ({e})"
+        log.error("character DB: %s", e)
     try:
         S.settings = load_settings()
     except SettingsError as e:
@@ -95,6 +107,7 @@ def status():
         "models": S.manager.snapshot() if S.manager else None,
         "settings": {"seed": S.settings.seed, "randomize_seed": S.settings.randomize_seed},
         "lora_cache": S.loras.snapshot(),
+        "workspace": _workspace_view(),
     }
 
 
@@ -150,7 +163,15 @@ def put_settings(patch: dict):
 
 def _lora_view() -> dict:
     stack = [{**e, "info": S.loras.inspect(e["path"]).to_dict()} for e in S.settings.loras]
-    return {"stack": stack, "default_dir": str(LORA_DIR), "max_loras": MAX_LORAS, "strength_limit": STRENGTH_LIMIT,
+    c = _active_character()
+    locked = None
+    if c and c["lora_path"]:
+        key = _pathkey(c["lora_path"])
+        for e in stack:
+            e["shadowed"] = _pathkey(e["path"]) == key  # the character's LoRA replaces this entry while active
+        locked = {"path": c["lora_path"], "strength": c["lora_strength"], "enabled": True, "character": c["name"],
+                  "info": S.loras.inspect(c["lora_path"]).to_dict()}
+    return {"stack": stack, "locked": locked, "default_dir": str(LORA_DIR), "max_loras": MAX_LORAS, "strength_limit": STRENGTH_LIMIT,
             "cache": S.loras.snapshot(), "busy": bool(S.runner and S.runner.busy)}
 
 
@@ -184,8 +205,7 @@ def put_loras(body: LoraStack):
     save_settings(new)
     S.settings = new
     if S.runner:  # drop removed adapters from RAM on the worker thread (after any running job; never blocks this request)
-        keep = [e["path"] for e in new.loras]
-        S.runner.defer_to_worker(lambda: S.loras.evict_except(keep))
+        _evict_unused()
     return _lora_view()
 
 
@@ -237,11 +257,145 @@ def browse(path: str = Query("")):
     return {"path": str(p), "parent": parent, "entries": entries}
 
 
+# ------------------------------------------------------------------------------------------ characters
+
+
+def _pathkey(p: str) -> str:
+    return os.path.normcase(os.path.abspath(p))
+
+
+def _store() -> CharacterStore:
+    if S.characters is None:
+        raise HTTPException(503, S.startup_error or "Character database unavailable")
+    return S.characters
+
+
+def _active_character() -> dict | None:
+    if not S.workspace or S.workspace.get("character_id") is None or S.characters is None:
+        return None
+    try:
+        return S.characters.get(S.workspace["character_id"])
+    except NotFound:
+        S.workspace = None  # deleted elsewhere
+        return None
+
+
+def _workspace_view() -> dict | None:
+    if S.workspace is None:
+        return None
+    return {"character": _active_character()}
+
+
+def _effective_stack() -> list[dict]:
+    """The stack a generation uses: the active character's LoRA first (locked), then the user's stack
+    without any entry for the same file."""
+    user = [dict(e) for e in S.settings.loras]
+    c = _active_character()
+    if not c or not c["lora_path"]:
+        return user
+    key = _pathkey(c["lora_path"])
+    return [{"path": c["lora_path"], "strength": c["lora_strength"], "enabled": True}] + [e for e in user if _pathkey(e["path"]) != key]
+
+
+def _evict_unused() -> None:
+    """Free cached adapters that neither the user's stack nor the active character uses (on the GPU worker)."""
+    if S.runner:
+        keep = [e["path"] for e in _effective_stack()]
+        S.runner.defer_to_worker(lambda: S.loras.evict_except(keep))
+
+
+def _character_view(c: dict) -> dict:
+    out = dict(c)
+    out["lora_info"] = S.loras.inspect(c["lora_path"]).to_dict() if c["lora_path"] else None
+    return out
+
+
+def _check_character_lora(path) -> None:
+    if isinstance(path, str) and path.strip().strip('"'):
+        info = S.loras.inspect(path.strip().strip('"'))
+        if not info.compatible:
+            raise HTTPException(400, f"LoRA {info.filename}: " + "; ".join(info.problems))
+
+
+def _character_call(fn):
+    try:
+        return fn()
+    except NotFound as e:
+        raise HTTPException(404, str(e)) from e
+    except Duplicate as e:
+        raise HTTPException(409, str(e)) from e
+    except CharacterError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.get("/api/characters")
+def list_characters():
+    return {"characters": [_character_view(c) for c in _store().list()], "workspace": _workspace_view()}
+
+
+@app.post("/api/characters")
+def create_character(body: dict):
+    store = _store()
+    _check_character_lora(body.get("lora_path"))
+    return _character_view(_character_call(lambda: store.create(body)))
+
+
+@app.get("/api/characters/{cid}")
+def get_character(cid: int):
+    store = _store()
+    return _character_view(_character_call(lambda: store.get(cid)))
+
+
+@app.put("/api/characters/{cid}")
+def update_character(cid: int, body: dict):
+    store = _store()
+    _check_character_lora(body.get("lora_path"))
+    c = _character_call(lambda: store.update(cid, body))
+    if S.workspace and S.workspace.get("character_id") == cid:
+        _evict_unused()  # the active character's LoRA may have changed
+    return _character_view(c)
+
+
+@app.delete("/api/characters/{cid}")
+def delete_character(cid: int):
+    store = _store()
+    _character_call(lambda: store.delete(cid))  # never touches the LoRA file itself
+    if S.workspace and S.workspace.get("character_id") == cid:
+        S.workspace = None
+        _evict_unused()
+    return {"deleted": cid, "workspace": _workspace_view()}
+
+
+class WorkspaceRequest(BaseModel):
+    character_id: int | None = None  # None = generate without a character
+
+
+@app.post("/api/workspace")
+def enter_workspace(body: WorkspaceRequest):
+    """Load a character (or none) into the generation workspace. Allowed while a job runs: that job keeps
+    the prompt and LoRA stack it was submitted with."""
+    if body.character_id is not None:
+        store = _store()
+        c = _character_call(lambda: store.get(body.character_id))
+        _check_character_lora(c["lora_path"])
+    S.workspace = {"character_id": body.character_id}
+    _evict_unused()
+    return {"workspace": _workspace_view()}
+
+
+@app.delete("/api/workspace")
+def leave_workspace():
+    S.workspace = None
+    _evict_unused()
+    return {"workspace": None}
+
+
 # ------------------------------------------------------------------------------------------ GPU jobs
 
 
 class EncodeRequest(BaseModel):
     prompt: str = Field(..., max_length=20000)
+    prepend_trigger: bool = True  # only used while a character with a trigger is active
 
 
 class GenerateRequest(BaseModel):
@@ -251,13 +405,24 @@ class GenerateRequest(BaseModel):
     multiple: int
     width: int
     height: int
+    prepend_trigger: bool = True
+
+
+def _effective_prompt(prompt: str, prepend: bool) -> tuple[str, dict | None, bool]:
+    """(prompt to encode, active character, whether its trigger was prepended)."""
+    c = _active_character()
+    if not c or not prompt.strip():
+        return prompt, c, False
+    p = compose_prompt(prompt, c["trigger"], prepend)
+    return p, c, p != prompt
 
 
 @app.post("/api/encode")
 def encode(req: EncodeRequest):
     runner = _runner()
+    prompt, _, _ = _effective_prompt(req.prompt, req.prepend_trigger)
     try:
-        job = runner.submit_encode(req.prompt)
+        job = runner.submit_encode(prompt)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     except Busy as e:
@@ -275,8 +440,10 @@ def generate(req: GenerateRequest):
     if (res.width, res.height) != (req.width, req.height):
         raise HTTPException(400, f"Displayed size {req.width}x{req.height} disagrees with the server's {res.width}x{res.height}; reload the page.")
     seed = new_random_seed() if S.settings.randomize_seed else S.settings.seed
+    prompt, c, prepended = _effective_prompt(req.prompt, req.prepend_trigger)
+    extra = {"character": {"id": c["id"], "name": c["name"]} if c else None, "user_prompt": req.prompt, "trigger_prepended": prepended}
     try:
-        job = runner.submit_generate(req.prompt, res, seed, S.settings.loras)
+        job = runner.submit_generate(prompt, res, seed, _effective_stack(), extra_meta=extra)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     except Busy as e:

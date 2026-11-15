@@ -57,6 +57,10 @@ file header and refuses incompatible files; it never loads a different model or 
 .venv\Scripts\python.exe run.py            # http://127.0.0.1:7860  (localhost only, one worker)
 ```
 
+The app opens on a **landing page**: pick a character from the list and click **Load**, create / edit /
+delete characters, or **Continue without a character** for free generation. **Switch** (top of the
+sidebar) returns to the landing page.
+
 Workflow: type a prompt → **Encode Prompt** (state turns *Encoded*) → choose resolution →
 **Generate Image**. Generate again (other seed/resolution) without re-encoding. Editing the prompt or
 changing the text encoder marks the prompt *Not Encoded*. Seed (default 42) and *Randomize seed* are in
@@ -81,6 +85,24 @@ the stack it was started with). No re-encode is needed: LoRAs only affect the tr
 * Order does not change the result: LoRA updates are additive (it only matters for rounding).
 * Used LoRAs (file, strength, rank) are recorded in the image metadata.
 
+### Characters
+
+Characters are stored in a local SQLite database, `data/prompthouse.db` (created on first start; not in git).
+Each character has a name (unique), an optional LoRA with a default strength, a trigger phrase, whether the
+trigger is prepended by default, and a free-text description. Picking a LoRA in the editor fills the trigger
+from the file's metadata when it has one.
+
+While a character is loaded:
+* Its LoRA is **locked** at the top of the LoRA panel (🔒) at the character's strength (change it with
+  **Edit**). The rest of the stack still works as additional LoRAs; a stack entry for the same file is skipped.
+* Its trigger is **prepended** to the prompt (`"<trigger>, <prompt>"`) unless the prompt already starts with
+  it; the *Prepend trigger* checkbox turns this off (remembered per character), and "Encodes as:" shows the
+  exact prompt that is encoded.
+* Image metadata records the character, the prompt as typed, and whether the trigger was prepended.
+
+Deleting a character removes only its record, never the LoRA file. The loaded character is not remembered
+across server restarts (the app always starts on the landing page).
+
 **Windows tip:** in NVIDIA Control Panel → Manage 3D settings → Program settings → `python.exe`, set
 *CUDA – Sysmem Fallback Policy* to **Prefer No Sysmem Fallback**. Otherwise the driver silently spills
 over-allocations into (very slow) shared system memory instead of raising an out-of-memory error. The app
@@ -89,7 +111,7 @@ plans memory to avoid this and flags it if it happens anyway.
 ## Tests and checks
 
 ```powershell
-.venv\Scripts\python.exe -m pytest -q tests                 # 191 tests; GPU lifecycle tests use tiny modules
+.venv\Scripts\python.exe -m pytest -q tests                 # 212 tests; GPU lifecycle tests use tiny modules
 .venv\Scripts\python.exe scripts\smoke_test.py --repeat 2   # real encode -> sample -> decode, same modules as the app
 .venv\Scripts\python.exe scripts\ui_e2e.py                  # drives the running UI in Edge (needs run.py)
 .venv\Scripts\python.exe scripts\lora_check.py [--full]    # LoRA math on real FP8 layers; --full = real sampling
@@ -100,7 +122,8 @@ plans memory to avoid this and flags it if it happens anyway.
 Unit tests cover dimension calculation, seeds, settings persistence, prompt-cache invalidation and stale
 results, cached-conditioning reuse, rejection of simultaneous GPU jobs, cleanup after exceptions/OOM,
 stage separation/order, FP8 layer math, block streaming equivalence, RAM release, LoRA key formats/rejections,
-LoRA math vs. merged weights, stacking, disable/zero strength, streaming + LoRA, no base reload on stack changes. They do **not** prove
+LoRA math vs. merged weights, stacking, disable/zero strength, streaming + LoRA, no base reload on stack changes, character storage/validation, trigger prepending, the character LoRA lock.
+They do **not** prove
 Krea 2 generation — the smoke test and UI test do that with real weights.
 
 ## Verification status (this machine)
@@ -117,6 +140,7 @@ Krea 2 generation — the smoke test and UI test do that with real weights.
 | LoRA panel (add/refuse incompatible/duplicate, strength, disable, reorder by arrows and drag, persist, remove) | ✅ Edge via Playwright |
 | A *trained* Krea 2 LoRA in a full real generation through the UI | ✅ tested manually by the user — loaded a LoRA and generated; worked as expected |
 | Automated full-pipeline LoRA check (`lora_check.py --full`) | not run — needs ~16 GB free RAM. Streaming + LoRA equivalence and "no base reload" are unit-tested with a stand-in model. |
+| Characters: landing page, create/edit/delete, load, locked LoRA, trigger prepend/toggle, free mode, switch, reload | ✅ Edge via Playwright (synthetic LoRAs); API + store unit-tested; character creation and the LoRA lock confirmed manually by the user with a real LoRA. |
 | Real CUDA OOM | handling tested with simulated OOM only; memory planning avoided OOM in all real runs |
 
 ## Known limitations

@@ -152,3 +152,20 @@ FastAPI endpoints stay responsive during inference (`/api/system` measured at 2 
   disabled entries are skipped entirely (bit-identical to no LoRA).
 * The generate request captures the stack at submit time; the PUT `/api/loras` endpoint replaces the whole
   ordered stack and is allowed while a job runs.
+
+## Characters (`app/characters.py`)
+
+* **Storage:** stdlib `sqlite3`, one file at `data/prompthouse.db`, a connection per operation (FastAPI runs
+  sync endpoints on a thread pool), writes serialised by a lock. Schema migrations are an ordered list applied
+  by `PRAGMA user_version`; a database from a newer version is refused rather than modified.
+* **Table `characters`:** `name` (UNIQUE, `COLLATE NOCASE`), `description`, `lora_path` (`''` = none),
+  `lora_strength`, `trigger`, `prepend_trigger`, timestamps. A LoRA path is checked with the LoRA inspector
+  when it is saved and when the character is loaded.
+* **Workspace** (`S.workspace` in `app/main.py`, in memory): `None` = landing page, `{"character_id": id | None}`
+  = generator. The character row is re-read on every use, so edits to the loaded character apply immediately.
+* **Generation:** `_effective_stack()` = the character's LoRA first (strength from the record, always enabled),
+  then the user's stack minus any entry for the same file. `_effective_prompt()` applies `compose_prompt`
+  (mirrored by `composePrompt` in `static/app.js`, which compares it with the cached conditioning), on both
+  `/api/encode` and `/api/generate`, so a character switch after encoding is detected as *Not Encoded*.
+* **Eviction:** after any stack or workspace change, cached adapters not used by the effective stack are freed on
+  the GPU worker thread (so the character's LoRA stays cached while it is loaded).

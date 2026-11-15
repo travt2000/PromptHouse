@@ -124,6 +124,32 @@ label.check { flex-direction: row; align-items: center; gap: 8px; color: var(--t
 .lora-meta.err { color: var(--err); }
 .lora-meta .warn { color: var(--warn); }
 
+.lora-item.locked { border-color: color-mix(in srgb, var(--accent-2) 55%, transparent); }
+.lora-item.locked.bad { border-color: color-mix(in srgb, var(--err) 55%, transparent); }
+.lora-lock { font-size: 12px; }
+.lora-fixed { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+#lora-locked:empty { display: none; }
+
+/* characters */
+.landing { min-height: 100vh; display: grid; place-items: center; padding: 16px; }
+.landing-card { width: min(560px, 100%); background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 24px; display: flex; flex-direction: column; gap: 12px; }
+.landing-brand { font-weight: 700; font-size: 26px; letter-spacing: .2px; }
+.landing-brand span { color: var(--accent); }
+.landing-foot { border-top: 1px solid var(--border); padding-top: 12px; margin-top: 4px; }
+.char-summary { background: #0f1115; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font-size: 13px; display: flex; flex-direction: column; gap: 4px; }
+.char-summary:empty { display: none; }
+.char-summary .desc { color: var(--muted); white-space: pre-wrap; max-height: 8em; overflow: auto; }
+.row.wrap { flex-wrap: wrap; }
+.row.tight { gap: 6px; }
+.spacer { flex: 1; }
+.btn.danger:hover:not(:disabled) { background: color-mix(in srgb, var(--err) 30%, #262a33); }
+.btn.link { background: none; border: none; color: var(--accent); padding: 4px 0; }
+.btn.link:hover:not(:disabled) { background: none; text-decoration: underline; }
+.char-name { font-size: 16px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.char-bar.none .char-name { color: var(--muted); font-weight: 500; font-size: 14px; }
+#prepend-wrap code { color: var(--accent); }
+.preview { white-space: pre-wrap; word-break: break-word; max-height: 4.5em; overflow: hidden; }
+
 @media (max-width: 860px) {
   .app { grid-template-columns: 1fr; height: auto; }
   .sidebar { border-right: none; }

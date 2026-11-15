@@ -18,6 +18,8 @@ MAX_SEED = 2**53 - 1  # exactly representable in JavaScript
 
 _DEFAULT_DIR = ROOT / "models" / "krea2turbo"
 LORA_DIR = ROOT / "models" / "loras"
+DATA_DIR = ROOT / "data"
+DB_FILE = DATA_DIR / "prompthouse.db"  # characters (SQLite)
 MAX_LORAS = 16
 LORA_STRENGTH_LIMIT = 5.0
 

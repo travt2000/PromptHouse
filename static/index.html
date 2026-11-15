@@ -3,11 +3,32 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Krea 2 Turbo</title>
+  <title>PromptHouse</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<div class="app">
+<div id="landing" class="landing" hidden>
+  <div class="landing-card">
+    <div class="landing-brand">Prompt<span>House</span></div>
+    <p class="hint">Choose a character to work with, or generate without one.</p>
+    <div id="landing-error" class="banner error" hidden></div>
+    <label>Character<select id="char-select"></select></label>
+    <div id="char-summary" class="char-summary"></div>
+    <div class="row wrap">
+      <button id="char-load" class="btn primary">Load</button>
+      <button id="char-edit" class="btn">Edit</button>
+      <button id="char-delete" class="btn danger">Delete</button>
+      <span class="spacer"></span>
+      <button id="char-new" class="btn">+ New character</button>
+    </div>
+    <div id="landing-msg" class="hint"></div>
+    <div class="landing-foot">
+      <button id="free-mode" class="btn link">Continue without a character →</button>
+    </div>
+  </div>
+</div>
+
+<div id="app" class="app" hidden>
   <aside class="sidebar">
     <header class="brand">
       <div class="brand-title">Krea 2 <span>Turbo</span></div>
@@ -18,9 +39,19 @@
 
     <div id="startup-error" class="banner error" hidden></div>
 
+    <section class="panel char-bar">
+      <div class="panel-head"><h2>Character</h2>
+        <span class="row tight"><button id="edit-active-char" class="btn small" hidden>Edit</button><button id="switch-char" class="btn small">Switch</button></span>
+      </div>
+      <div id="char-name" class="char-name">-</div>
+      <div id="char-detail" class="hint"></div>
+    </section>
+
     <section class="panel">
       <h2>Prompt</h2>
       <textarea id="prompt" rows="4" placeholder="Describe the image..." spellcheck="true"></textarea>
+      <label class="check" id="prepend-wrap" hidden><input type="checkbox" id="prepend"> Prepend trigger <code id="trigger-chip"></code></label>
+      <div id="prompt-preview" class="hint mono preview" hidden></div>
       <div class="row">
         <button id="encode-btn" class="btn">Encode Prompt</button>
         <span id="encode-state" class="pill">Not Encoded</span>
@@ -44,6 +75,7 @@
 
     <section class="panel">
       <div class="panel-head"><h2>LoRA</h2><span id="lora-count" class="hint"></span></div>
+      <div id="lora-locked"></div>
       <ul id="lora-list" class="lora-list"></ul>
       <button id="add-lora" class="btn small">+ Add LoRA</button>
       <div id="lora-msg" class="hint"></div>
@@ -110,6 +142,33 @@
     <div id="settings-msg" class="hint"></div>
     <div class="row end">
       <button id="save-settings" class="btn primary">Save</button>
+    </div>
+  </div>
+</div>
+
+<div id="char-editor" class="modal" hidden>
+  <div class="modal-card narrow">
+    <header class="modal-head"><h2 id="ce-title">New character</h2><button id="ce-close" class="icon-btn" aria-label="Close">&times;</button></header>
+    <label>Name<input id="ce-name" type="text" maxlength="100" autocomplete="off"></label>
+    <div class="model-field">
+      <label>Character LoRA (.safetensors, optional)</label>
+      <div class="path-row">
+        <input id="ce-lora" type="text" placeholder="No LoRA">
+        <button id="ce-lora-browse" class="btn small">Browse…</button>
+        <button id="ce-lora-clear" class="btn small">Clear</button>
+      </div>
+      <div id="ce-lora-info" class="hint"></div>
+    </div>
+    <div class="grid2">
+      <label>LoRA strength<input id="ce-strength" type="number" min="-5" max="5" step="0.05" value="1"></label>
+      <label>Trigger phrase<input id="ce-trigger" type="text" maxlength="200" autocomplete="off" placeholder="e.g. ohwx woman"></label>
+    </div>
+    <label class="check"><input id="ce-prepend" type="checkbox" checked> Prepend the trigger to prompts by default</label>
+    <label>Description / notes<textarea id="ce-description" rows="4" maxlength="10000"></textarea></label>
+    <div id="ce-msg" class="hint"></div>
+    <div class="row end">
+      <button id="ce-cancel" class="btn">Cancel</button>
+      <button id="ce-save" class="btn primary">Save</button>
     </div>
   </div>
 </div>

@@ -11,6 +11,12 @@ const state = {
   pollingJob: false,
   loras: [],              // ordered stack [{path, strength, enabled, info}]
   loraMeta: { default_dir: "", strength_limit: 5, max_loras: 16 },
+  loraLocked: null,       // the active character's LoRA (not part of the editable stack)
+  workspaceSig: undefined, // JSON of the last seen workspace, to detect changes
+  wsEpoch: 0,             // bumped by every workspace change made here; older status snapshots are dropped
+  wsToken: 0,             // latest onWorkspace refresh (older async refreshes give up)
+  characters: [],         // landing-page list
+  editingId: null,        // character editor: id being edited, null = new
 };
 
 function store(key, value) { try { localStorage.setItem(key, value); } catch (_) {} }
@@ -61,7 +67,7 @@ async function initResolution() {
 // ------------------------------------------------------------------------------------ encode state
 function encodeState() {
   const s = state.status;
-  const prompt = $("prompt").value;
+  const prompt = effectivePrompt();
   const job = s?.active_job;
   if (job && job.kind === "encode") return { label: "Encoding", cls: "busy" };
   const c = s?.conditioning;
@@ -85,10 +91,15 @@ function updateControls() {
   let detail = "";
   if (enc.label === "Encoded") detail = `${c.prompt_tokens} tokens · cached on ${c.device.toUpperCase()} · ${c.encoder}${c.truncated ? " · TRUNCATED to 512 tokens" : ""}`;
   else if (enc.label === "Error") detail = state.lastEncodeJob.error;
-  else if (c && c.prompt !== $("prompt").value) detail = "Prompt changed since the last encode.";
+  else if (c && c.prompt !== effectivePrompt()) detail = "Prompt changed since the last encode.";
   else if (c && !s.conditioning_valid_for_current_encoder) detail = "Text encoder changed; encode again.";
   $("encode-detail").textContent = detail;
   $("encode-detail").className = `hint ${enc.label === "Error" ? "err" : ""}`;
+
+  const eff = effectivePrompt();
+  const showPreview = eff !== $("prompt").value;
+  $("prompt-preview").hidden = !showPreview;
+  if (showPreview) $("prompt-preview").textContent = `Encodes as: ${eff}`;
 
   const st = state.settings;
   if (st) $("seed-mode").textContent = st.randomize_seed ? "Random seed per image" : `Fixed seed ${st.seed} (change in Settings)`;
@@ -98,10 +109,14 @@ function updateControls() {
 async function pollStatus() {
   for (;;) {
     try {
-      state.status = await api("/api/status");
+      const epoch = state.wsEpoch;
+      const st = await api("/api/status");
+      if (epoch !== state.wsEpoch) { await sleep(100); continue; } // a workspace change happened meanwhile; this snapshot is stale
+      state.status = st;
       const se = state.status.startup_error;
       $("startup-error").hidden = !se;
       $("startup-error").textContent = se || "";
+      await onWorkspace();
       renderJobFromStatus();
       renderResidency();
       updateControls();
@@ -158,10 +173,10 @@ function renderJobFromStatus() {
 }
 
 async function encode() {
-  const prompt = $("prompt").value;
+  const prompt = effectivePrompt(); // what the server will encode (trigger included)
   $("error-box").hidden = true;
   try {
-    const job = await api("/api/encode", { method: "POST", body: JSON.stringify({ prompt }) });
+    const job = await api("/api/encode", { method: "POST", body: JSON.stringify({ prompt: $("prompt").value, prepend_trigger: $("prepend").checked }) });
     state.lastEncodeJob = { prompt, status: "running" };
     state.status = { ...(state.status || {}), busy: true, active_job: job, conditioning: null };
     updateControls();
@@ -188,7 +203,7 @@ async function encode() {
 
 async function generate() {
   const r = currentResolution();
-  const body = { prompt: $("prompt").value, aspect: r.aspect, megapixels: r.megapixels_target, multiple: r.multiple, width: r.width, height: r.height };
+  const body = { prompt: $("prompt").value, prepend_trigger: $("prepend").checked, aspect: r.aspect, megapixels: r.megapixels_target, multiple: r.multiple, width: r.width, height: r.height };
   $("error-box").hidden = true;
   try {
     const job = await api("/api/generate", { method: "POST", body: JSON.stringify(body) });
@@ -240,7 +255,8 @@ function showImage(res) {
   $("viewer").classList.remove("empty");
   const tiled = res.decode && res.decode.tiled ? ` · VAE ${res.decode.mode}` : "";
   const loras = (res.metadata.loras || []).map((l) => `${l.file.replace(/\.safetensors$/i, "")} ${l.strength}`).join(", ");
-  $("image-info").textContent = `${res.width} × ${res.height} · seed ${res.seed} · ${res.metadata.transformer}${loras ? ` · LoRA: ${loras}` : ""} · ${res.seconds}s${tiled}`;
+  const who = res.metadata.character ? `${res.metadata.character.name} · ` : "";
+  $("image-info").textContent = `${who}${res.width} × ${res.height} · seed ${res.seed} · ${res.metadata.transformer}${loras ? ` · LoRA: ${loras}` : ""} · ${res.seconds}s${tiled}`;
   if (res.warnings && res.warnings.length) showError(res.warnings.join("\n"));
   const a = $("download");
   a.href = `/api/images/${res.image_id}?download=true`;
@@ -399,18 +415,36 @@ function loraMetaHtml(e) {
 }
 
 function renderLoraCount() {
-  const n = state.loras.length;
-  const active = state.loras.filter((e) => e.enabled && e.strength !== 0).length;
+  const L = state.loraLocked;
+  const n = state.loras.length + (L ? 1 : 0);
+  const active = state.loras.filter((e) => e.enabled && e.strength !== 0 && !e.shadowed).length + (L && L.strength !== 0 ? 1 : 0);
   $("lora-count").textContent = n ? `${active} of ${n} active` : "";
+}
+
+function renderLockedLora() {
+  const L = state.loraLocked;
+  if (!L) { $("lora-locked").innerHTML = ""; return; }
+  const bad = L.info && !L.info.compatible;
+  $("lora-locked").innerHTML = `<div class="lora-item locked${bad ? " bad" : ""}" id="locked-lora">
+      <div class="lora-top">
+        <span class="lora-lock" title="Locked by the active character">🔒</span>
+        <span class="lora-name" title="${esc(L.path)}">${esc(stem(L.path))}</span>
+        <span class="lora-fixed" title="Strength (change it in the character)">${esc(L.strength)}</span>
+      </div>
+      <div class="lora-meta">Character LoRA for ${esc(L.character)}; strength is set in the character.</div>
+      ${loraMetaHtml(L)}
+    </div>`;
 }
 
 function renderLoras() {
   const lim = state.loraMeta.strength_limit || 5;
   const n = state.loras.length;
+  renderLockedLora();
   $("lora-list").innerHTML = state.loras.map((e, i) => {
     const bad = e.info && !e.info.compatible;
     const sliderMax = Math.max(2, Math.ceil(Math.abs(e.strength)));
-    return `<li class="lora-item${e.enabled ? "" : " off"}${bad ? " bad" : ""}" data-i="${i}">
+    const note = e.shadowed ? `<div class="lora-meta warn">Not used: the character's LoRA is the same file.</div>` : "";
+    return `<li class="lora-item${e.enabled && !e.shadowed ? "" : " off"}${bad ? " bad" : ""}" data-i="${i}">
       <div class="lora-top">
         <span class="lora-handle" title="Drag to reorder">⋮⋮</span>
         <input type="checkbox" data-act="toggle" ${e.enabled ? "checked" : ""} title="${e.enabled ? "Disable" : "Enable"}" aria-label="Enable ${esc(stem(e.path))}">
@@ -423,7 +457,7 @@ function renderLoras() {
         <input type="range" data-act="slider" min="${-sliderMax}" max="${sliderMax}" step="0.05" value="${e.strength}" aria-label="Strength">
         <input type="number" data-act="num" min="${-lim}" max="${lim}" step="0.05" value="${e.strength}" aria-label="Strength value">
       </div>
-      ${loraMetaHtml(e)}
+      ${note}${loraMetaHtml(e)}
     </li>`;
   }).join("");
   renderLoraCount();
@@ -452,11 +486,13 @@ function saveLoras(delay = 0) {
 
 function applyLoraView(v, fromSave) {
   state.loraMeta = { default_dir: v.default_dir, strength_limit: v.strength_limit, max_loras: v.max_loras };
+  state.loraLocked = v.locked || null;
   const ae = document.activeElement;
   const editing = ae && $("lora-list").contains(ae) && (ae.type === "range" || ae.type === "number");
   if (fromSave && editing) {
     // don't rebuild the control the user is dragging/typing in; just refresh validation info
-    v.stack.forEach((e, i) => { if (state.loras[i] && state.loras[i].path === e.path) state.loras[i].info = e.info; });
+    v.stack.forEach((e, i) => { if (state.loras[i] && state.loras[i].path === e.path) { state.loras[i].info = e.info; state.loras[i].shadowed = e.shadowed; } });
+    renderLockedLora();
     return;
   }
   state.loras = v.stack;
@@ -464,6 +500,7 @@ function applyLoraView(v, fromSave) {
 }
 
 async function addLora(path) {
+  if (state.loraLocked && state.loraLocked.path.toLowerCase() === path.toLowerCase()) { setLoraMsg(`${baseName(path)} is the character's LoRA and is already applied.`, "warn"); return; }
   if (state.loras.some((e) => e.path.toLowerCase() === path.toLowerCase())) { setLoraMsg(`${baseName(path)} is already in the stack.`, "warn"); return; }
   if (state.loras.length >= (state.loraMeta.max_loras || 16)) { setLoraMsg("The LoRA stack is full.", "err"); return; }
   let info;
@@ -552,6 +589,216 @@ function wireLoras() {
   list.addEventListener("dragend", () => { if (dragFrom !== null) { dragFrom = null; renderLoras(); } });
 }
 
+// ------------------------------------------------------------------------------------ characters
+// The server holds the workspace: null = landing page, {character: {...} | null} = generator (null = no character).
+const activeCharacter = () => state.status?.workspace?.character || null;
+
+// Mirror of app/characters.py:compose_prompt — the UI compares its result with the cached conditioning.
+function composePrompt(prompt, trigger, prepend) {
+  trigger = (trigger || "").trim();
+  if (!prepend || !trigger) return prompt;
+  const body = prompt.replace(/^\s+/, "");
+  const re = new RegExp("^" + trigger.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "(?![0-9A-Za-z_])", "i");
+  if (re.test(body)) return prompt;
+  return `${trigger}, ${body}`;
+}
+function effectivePrompt() {
+  const p = $("prompt").value;
+  const c = activeCharacter();
+  if (!c || !p.trim()) return p;
+  return composePrompt(p, c.trigger, $("prepend").checked);
+}
+
+async function onWorkspace() {
+  const ws = state.status?.workspace ?? null;
+  const sig = JSON.stringify(ws);
+  if (sig === state.workspaceSig) return;
+  const prevId = state.workspaceSig ? JSON.parse(state.workspaceSig)?.character?.id : undefined;
+  state.workspaceSig = sig;
+  const token = ++state.wsToken;
+  $("landing").hidden = !!ws;
+  $("app").hidden = !ws;
+  if (!ws) { await loadLanding(); return; }
+  const c = ws.character;
+  if (c && c.id !== prevId) {
+    const saved = recall(`prepend:${c.id}`);
+    $("prepend").checked = saved === null ? c.prepend_trigger : saved === "1";
+  }
+  renderCharBar();
+  try {
+    const v = await api("/api/loras");
+    if (token !== state.wsToken) return; // superseded by a newer workspace change
+    applyLoraView(v);
+  } catch (_) {}
+  updateControls();
+}
+
+// Apply a workspace change made from this page and refresh immediately (not waiting for the poll).
+async function refreshWorkspace() {
+  state.wsEpoch++;
+  state.status = await api("/api/status");
+  state.workspaceSig = undefined;
+  await onWorkspace();
+}
+
+function renderCharBar() {
+  const c = activeCharacter();
+  document.querySelector(".char-bar").classList.toggle("none", !c);
+  $("char-name").textContent = c ? c.name : "No character";
+  $("edit-active-char").hidden = !c;
+  const bits = [];
+  if (c && c.lora_path) bits.push(`LoRA ${stem(c.lora_path)} @ ${c.lora_strength}`);
+  if (c && !c.lora_path) bits.push("No LoRA set");
+  if (c && c.trigger) bits.push(`trigger “${c.trigger}”`);
+  $("char-detail").textContent = c ? bits.join(" · ") : "Free generation — no character LoRA or trigger.";
+  $("prepend-wrap").hidden = !(c && c.trigger);
+  $("trigger-chip").textContent = c?.trigger || "";
+  document.title = c ? `${c.name} · PromptHouse` : "PromptHouse";
+}
+
+function setLandingMsg(text, cls = "") { $("landing-msg").textContent = text; $("landing-msg").className = `hint ${cls}`; }
+
+async function loadLanding(selectId) {
+  let data;
+  try { data = await api("/api/characters"); $("landing-error").hidden = true; }
+  catch (e) { $("landing-error").textContent = e.message; $("landing-error").hidden = false; data = { characters: [] }; }
+  state.characters = data.characters;
+  const want = String(selectId ?? $("char-select").value ?? recall("lastCharacter") ?? "");
+  const sel = $("char-select");
+  sel.innerHTML = state.characters.length
+    ? state.characters.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join("")
+    : `<option value="">No characters yet — create one</option>`;
+  const pick = state.characters.find((c) => String(c.id) === want) || state.characters.find((c) => String(c.id) === recall("lastCharacter"));
+  if (pick) sel.value = String(pick.id);
+  renderCharSummary();
+}
+
+const selectedCharacter = () => state.characters.find((c) => String(c.id) === $("char-select").value) || null;
+
+function renderCharSummary() {
+  const c = selectedCharacter();
+  const none = !c;
+  for (const id of ["char-load", "char-edit", "char-delete"]) $(id).disabled = none;
+  if (!c) { $("char-summary").innerHTML = ""; return; }
+  const rows = [];
+  if (c.lora_path) {
+    const bad = c.lora_info && !c.lora_info.compatible;
+    rows.push(`<div><span class="k">LoRA</span> <span class="mono" title="${esc(c.lora_path)}">${esc(baseName(c.lora_path))}</span> @ ${esc(c.lora_strength)}</div>`);
+    if (bad) rows.push(`<div class="hint err">${esc(c.lora_info.problems.join(" "))}</div>`);
+  } else rows.push(`<div class="hint">No LoRA set</div>`);
+  if (c.trigger) rows.push(`<div><span class="k">Trigger</span> <span class="mono">${esc(c.trigger)}</span>${c.prepend_trigger ? "" : ' <span class="hint">(not prepended by default)</span>'}</div>`);
+  if (c.description) rows.push(`<div class="desc">${esc(c.description)}</div>`);
+  $("char-summary").innerHTML = rows.join("");
+  $("char-load").disabled = !!(c.lora_path && c.lora_info && !c.lora_info.compatible);
+}
+
+async function enterWorkspace(characterId) {
+  setLandingMsg("");
+  state.wsEpoch++;
+  try {
+    await api("/api/workspace", { method: "POST", body: JSON.stringify({ character_id: characterId }) });
+    if (characterId !== null) store("lastCharacter", String(characterId));
+    await refreshWorkspace();
+  } catch (e) { setLandingMsg(e.message, "err"); }
+}
+
+async function leaveWorkspace() {
+  state.wsEpoch++;
+  try { await api("/api/workspace", { method: "DELETE" }); } catch (_) {}
+  try { await refreshWorkspace(); } catch (e) { showError(e.message); }
+}
+
+async function deleteCharacter() {
+  const c = selectedCharacter();
+  if (!c) return;
+  if (!confirm(`Delete the character "${c.name}"?\n\nThis removes the character record only; the LoRA file is not touched.`)) return;
+  try {
+    await api(`/api/characters/${c.id}`, { method: "DELETE" });
+    setLandingMsg(`Deleted ${c.name}.`, "ok");
+    await loadLanding("");
+  } catch (e) { setLandingMsg(e.message, "err"); }
+}
+
+// editor
+function setEditorMsg(text, cls = "") { $("ce-msg").textContent = text; $("ce-msg").className = `hint ${cls}`; }
+
+function openEditor(c) {
+  state.editingId = c ? c.id : null;
+  $("ce-title").textContent = c ? `Edit ${c.name}` : "New character";
+  $("ce-name").value = c?.name || "";
+  $("ce-lora").value = c?.lora_path || "";
+  $("ce-strength").value = c ? c.lora_strength : 1;
+  $("ce-trigger").value = c?.trigger || "";
+  $("ce-prepend").checked = c ? c.prepend_trigger : true;
+  $("ce-description").value = c?.description || "";
+  setEditorMsg("");
+  $("ce-lora-info").innerHTML = "";
+  $("char-editor").hidden = false;
+  if (c?.lora_path) checkEditorLora(false);
+  $("ce-name").focus();
+}
+
+async function checkEditorLora(autofill) {
+  const path = $("ce-lora").value.trim().replace(/^"|"$/g, "");
+  if (!path) { $("ce-lora-info").innerHTML = ""; return true; }
+  let v;
+  try { v = await api("/api/validate-path", { method: "POST", body: JSON.stringify({ kind: "lora", path }) }); }
+  catch (e) { $("ce-lora-info").innerHTML = `<span class="err">${esc(e.message)}</span>`; return false; }
+  $("ce-lora-info").innerHTML = loraMetaHtml({ info: v });
+  if (v.compatible && autofill) {
+    if (!$("ce-trigger").value.trim() && v.trigger) $("ce-trigger").value = v.trigger;
+    if (!$("ce-name").value.trim()) $("ce-name").value = stem(path);
+  }
+  return v.compatible;
+}
+
+async function saveEditor() {
+  const strength = Number($("ce-strength").value);
+  if ($("ce-strength").value.trim() === "" || !Number.isFinite(strength)) { setEditorMsg("LoRA strength must be a number.", "err"); return; }
+  const body = {
+    name: $("ce-name").value,
+    lora_path: $("ce-lora").value.trim().replace(/^"|"$/g, ""),
+    lora_strength: strength,
+    trigger: $("ce-trigger").value,
+    prepend_trigger: $("ce-prepend").checked,
+    description: $("ce-description").value,
+  };
+  if (!body.name.trim()) { setEditorMsg("Name is required.", "err"); $("ce-name").focus(); return; }
+  try {
+    const id = state.editingId;
+    const c = await api(id === null ? "/api/characters" : `/api/characters/${id}`, { method: id === null ? "POST" : "PUT", body: JSON.stringify(body) });
+    $("char-editor").hidden = true;
+    if (!$("landing").hidden) { await loadLanding(c.id); setLandingMsg(`Saved ${c.name}.`, "ok"); }
+    if (activeCharacter()?.id === c.id) await refreshWorkspace(); // character bar + locked LoRA
+  } catch (e) { setEditorMsg(e.message, "err"); }
+}
+
+function wireCharacters() {
+  $("char-select").addEventListener("change", () => { renderCharSummary(); setLandingMsg(""); });
+  $("char-load").addEventListener("click", () => { const c = selectedCharacter(); if (c) enterWorkspace(c.id); });
+  $("free-mode").addEventListener("click", () => enterWorkspace(null));
+  $("char-new").addEventListener("click", () => openEditor(null));
+  $("char-edit").addEventListener("click", () => { const c = selectedCharacter(); if (c) openEditor(c); });
+  $("char-delete").addEventListener("click", deleteCharacter);
+  $("switch-char").addEventListener("click", leaveWorkspace);
+  $("edit-active-char").addEventListener("click", () => { const c = activeCharacter(); if (c) openEditor(c); });
+  $("prepend").addEventListener("change", () => {
+    const c = activeCharacter();
+    if (c) store(`prepend:${c.id}`, $("prepend").checked ? "1" : "0");
+    updateControls();
+  });
+  $("ce-close").addEventListener("click", () => { $("char-editor").hidden = true; });
+  $("ce-cancel").addEventListener("click", () => { $("char-editor").hidden = true; });
+  $("ce-save").addEventListener("click", saveEditor);
+  $("ce-lora").addEventListener("change", () => checkEditorLora(true));
+  $("ce-lora-clear").addEventListener("click", () => { $("ce-lora").value = ""; $("ce-lora-info").innerHTML = ""; });
+  $("ce-lora-browse").addEventListener("click", () => {
+    const cur = $("ce-lora").value.trim();
+    const start = cur ? cur.replace(/[\\/][^\\/]*$/, "") : (recall("loraDir") || state.loraMeta.default_dir || "");
+    browse("char_lora", "file", start, (p) => { $("ce-lora").value = p; store("loraDir", p.replace(/[\\/][^\\/]*$/, "")); checkEditorLora(true); });
+  });
+}
+
 // ------------------------------------------------------------------------------------ wiring
 function wire() {
   const saved = recall("prompt");
@@ -576,8 +823,12 @@ function wire() {
   });
   $("browser-pick-dir").addEventListener("click", (ev) => pickPath(ev.target.dataset.path));
   wireLoras();
+  wireCharacters();
   document.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape") { $("browser").hidden = true; $("settings").hidden = true; }
+    if (ev.key !== "Escape") return;
+    if (!$("browser").hidden) { $("browser").hidden = true; return; } // the browser can sit on top of the editor
+    $("settings").hidden = true;
+    $("char-editor").hidden = true;
   });
 }
 
@@ -587,7 +838,12 @@ function wire() {
     await initResolution();
     state.settings = (await api("/api/settings")).settings;
     applyLoraView(await api("/api/loras"));
-  } catch (e) { showError(`Failed to reach the server: ${e.message}`); }
+    state.status = await api("/api/status");
+    await onWorkspace(); // landing page unless a character (or free mode) is already loaded
+  } catch (e) {
+    $("app").hidden = false;
+    showError(`Failed to reach the server: ${e.message}`);
+  }
   updateControls();
   pollStatus();
   pollSystem();

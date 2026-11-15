@@ -12,6 +12,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "SETTINGS_FILE", tmp_path / "settings.json")
+    monkeypatch.setattr(config, "DB_FILE", tmp_path / "chars.db")
     from app.main import app
 
     with TestClient(app) as c:
