@@ -2,7 +2,8 @@
 
 A character is the unit the rest of the app will grow around. For now it holds:
   name (unique, case-insensitive), description, an optional LoRA (path + default strength),
-  a trigger phrase, and whether that trigger is prepended to prompts by default.
+  a trigger phrase, whether that trigger is prepended to prompts by default, and the name of its
+  Markdown document folder (see app/character_docs.py).
 
 Schema changes are applied in order by `_MIGRATIONS`, tracked with SQLite's `PRAGMA user_version`.
 """
@@ -39,6 +40,10 @@ _MIGRATIONS = [
         created_at      TEXT    NOT NULL,
         updated_at      TEXT    NOT NULL
     );
+    """,
+    # v2: per-character document folder (name under the documents root; '' = not provisioned yet)
+    """
+    ALTER TABLE characters ADD COLUMN folder TEXT NOT NULL DEFAULT '';
     """,
 ]
 
@@ -131,6 +136,15 @@ class CharacterStore:
                 raise Duplicate(f"A character named '{v['name']}' already exists") from e
             if cur.rowcount == 0:
                 raise NotFound(f"Character {cid} not found")
+        return self.get(cid)
+
+    def set_folder(self, cid: int, folder: str) -> dict:
+        """Not a user-editable field: assigned once when the character's document folder is created."""
+        with self._lock, closing(self._connect()) as db:
+            cur = db.execute("UPDATE characters SET folder = ? WHERE id = ?", (folder, cid))
+            db.commit()
+        if cur.rowcount == 0:
+            raise NotFound(f"Character {cid} not found")
         return self.get(cid)
 
     def delete(self, cid: int) -> None:

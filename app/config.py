@@ -18,8 +18,10 @@ MAX_SEED = 2**53 - 1  # exactly representable in JavaScript
 
 _DEFAULT_DIR = ROOT / "models" / "krea2turbo"
 LORA_DIR = ROOT / "models" / "loras"
-DATA_DIR = ROOT / "data"
+# User data (character database + document folders). PROMPTHOUSE_DATA_DIR moves it, e.g. for tests.
+DATA_DIR = Path(os.environ.get("PROMPTHOUSE_DATA_DIR") or ROOT / "data")
 DB_FILE = DATA_DIR / "prompthouse.db"  # characters (SQLite)
+CHARACTER_DOCS_DIR = DATA_DIR / "characters"  # one Markdown folder per character
 MAX_LORAS = 16
 LORA_STRENGTH_LIMIT = 5.0
 

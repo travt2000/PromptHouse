@@ -646,6 +646,7 @@ function renderCharBar() {
   document.querySelector(".char-bar").classList.toggle("none", !c);
   $("char-name").textContent = c ? c.name : "No character";
   $("edit-active-char").hidden = !c;
+  $("docs-active-char").hidden = !c;
   const bits = [];
   if (c && c.lora_path) bits.push(`LoRA ${stem(c.lora_path)} @ ${c.lora_strength}`);
   if (c && !c.lora_path) bits.push("No LoRA set");
@@ -678,7 +679,7 @@ const selectedCharacter = () => state.characters.find((c) => String(c.id) === $(
 function renderCharSummary() {
   const c = selectedCharacter();
   const none = !c;
-  for (const id of ["char-load", "char-edit", "char-delete"]) $(id).disabled = none;
+  for (const id of ["char-load", "char-edit", "char-docs", "char-delete"]) $(id).disabled = none;
   if (!c) { $("char-summary").innerHTML = ""; return; }
   const rows = [];
   if (c.lora_path) {
@@ -711,10 +712,10 @@ async function leaveWorkspace() {
 async function deleteCharacter() {
   const c = selectedCharacter();
   if (!c) return;
-  if (!confirm(`Delete the character "${c.name}"?\n\nThis removes the character record only; the LoRA file is not touched.`)) return;
+  if (!confirm(`Delete the character "${c.name}"?\n\nThis removes the character record only. The LoRA file and the character's document folder are kept on disk.`)) return;
   try {
-    await api(`/api/characters/${c.id}`, { method: "DELETE" });
-    setLandingMsg(`Deleted ${c.name}.`, "ok");
+    const r = await api(`/api/characters/${c.id}`, { method: "DELETE" });
+    setLandingMsg(`Deleted ${c.name}.${r.docs_kept ? ` Documents kept in ${r.docs_kept}` : ""}`, "ok");
     await loadLanding("");
   } catch (e) { setLandingMsg(e.message, "err"); }
 }
@@ -799,6 +800,157 @@ function wireCharacters() {
   });
 }
 
+// ------------------------------------------------------------------------------------ character documents
+// Markdown files in the character's folder. Saves send the file's mtime; the server refuses (409) if the
+// file changed on disk meanwhile (e.g. edited in another editor), so nothing is silently overwritten.
+const docs = { cid: null, files: [], cur: null }; // cur: {path, mtime, original}
+
+const docsDirty = () => !!docs.cur && $("docs-text").value !== docs.cur.original;
+function setDocsMsg(html, cls = "") { $("docs-msg").innerHTML = html; $("docs-msg").className = `hint ${cls}`; }
+function confirmDiscard() { return !docsDirty() || confirm(`Discard unsaved changes to ${docs.cur.path}?`); }
+
+async function openDocs(c) {
+  docs.cid = c.id;
+  docs.cur = null;
+  $("docs-title").textContent = `${c.name} — documents`;
+  $("docs-results").innerHTML = "";
+  $("docs-q").value = "";
+  showDoc(null);
+  setDocsMsg("");
+  $("docs").hidden = false;
+  await refreshDocs();
+}
+
+function closeDocs() {
+  if (!confirmDiscard()) return;
+  $("docs").hidden = true;
+  docs.cur = null;
+}
+
+async function refreshDocs() {
+  try {
+    const r = await api(`/api/characters/${docs.cid}/docs`);
+    docs.files = r.files;
+    $("docs-folder").textContent = r.folder;
+    $("docs-folder").title = r.folder;
+    renderDocList();
+  } catch (e) { setDocsMsg(esc(e.message), "err"); }
+}
+
+function renderDocList() {
+  const cur = docs.cur?.path;
+  $("docs-list").innerHTML = docs.files.length ? docs.files.map((f) => `
+    <li data-path="${esc(f.path)}" class="${f.path === cur ? "active" : ""}" title="${esc(f.title)}">
+      <span class="doc-path">${esc(f.path)}</span>
+      <span class="doc-meta">${esc(f.type)}${f.tags.length ? ` · ${esc(f.tags.join(", "))}` : ""} · ${(f.size / 1024).toFixed(1)} KB</span>
+    </li>`).join("") : `<li class="hint">No Markdown files yet.</li>`;
+}
+
+function showDoc(d) {
+  docs.cur = d ? { path: d.path, mtime: d.mtime, original: d.content } : null;
+  $("docs-text").value = d ? d.content : "";
+  $("docs-text").disabled = !d;
+  $("docs-path").textContent = d ? d.path : "";
+  $("docs-delete").disabled = !d;
+  updateDocsDirty();
+  renderDocList();
+}
+
+function updateDocsDirty() {
+  const dirty = docsDirty();
+  $("docs-dirty").textContent = dirty ? "● unsaved" : "";
+  $("docs-save").disabled = !dirty;
+}
+
+async function loadDoc(path) {
+  try {
+    showDoc(await api(`/api/characters/${docs.cid}/docs/file?path=${encodeURIComponent(path)}`));
+    setDocsMsg("");
+  } catch (e) { setDocsMsg(esc(e.message), "err"); await refreshDocs(); }
+}
+
+async function saveDoc() {
+  if (!docs.cur) return;
+  const content = $("docs-text").value;
+  try {
+    const r = await api(`/api/characters/${docs.cid}/docs/file`, { method: "PUT", body: JSON.stringify({ path: docs.cur.path, content, expected_mtime: docs.cur.mtime }) });
+    docs.cur = { path: r.path, mtime: r.mtime, original: content };
+    updateDocsDirty();
+    setDocsMsg(`Saved ${esc(r.path)}.`, "ok");
+    await refreshDocs();
+  } catch (e) {
+    const reload = e.message.includes("changed on disk") || e.message.includes("deleted on disk");
+    setDocsMsg(esc(e.message) + (reload ? ` <button class="btn small" id="docs-reload">Reload from disk (discard my edits)</button>` : ""), "err");
+  }
+}
+
+async function newDoc() {
+  if (!confirmDiscard()) return;
+  let name = prompt("New document path inside the character's folder (e.g. notes/wardrobe.md):", "notes/");
+  if (name === null) return;
+  name = name.trim();
+  if (!name || name.endsWith("/")) { setDocsMsg("Enter a file name.", "err"); return; }
+  if (!/\.md$/i.test(name)) name += ".md";
+  const title = baseName(name).replace(/\.md$/i, "").replace(/[-_]+/g, " ");
+  const content = `# ${title.charAt(0).toUpperCase()}${title.slice(1)}\n\n`;
+  try {
+    const r = await api(`/api/characters/${docs.cid}/docs/file`, { method: "PUT", body: JSON.stringify({ path: name, content, expected_mtime: null }) });
+    await refreshDocs();
+    await loadDoc(r.path);
+    $("docs-text").focus();
+  } catch (e) { setDocsMsg(esc(e.message), "err"); }
+}
+
+async function deleteDoc() {
+  if (!docs.cur || !confirm(`Delete ${docs.cur.path}? The file is removed from disk.`)) return;
+  try {
+    await api(`/api/characters/${docs.cid}/docs/file?path=${encodeURIComponent(docs.cur.path)}`, { method: "DELETE" });
+    setDocsMsg(`Deleted ${esc(docs.cur.path)}.`, "ok");
+    showDoc(null);
+    await refreshDocs();
+  } catch (e) { setDocsMsg(esc(e.message), "err"); }
+}
+
+async function searchDocs() {
+  const q = $("docs-q").value.trim();
+  if (!q) { $("docs-results").innerHTML = ""; return; }
+  try {
+    const r = await api(`/api/characters/${docs.cid}/context?k=5&q=${encodeURIComponent(q)}`);
+    const warn = r.warnings.length ? `<div class="hint warn">${r.warnings.map((w) => `${esc(w.path)}: ${esc(w.warning)}`).join("<br>")}</div>` : "";
+    $("docs-results").innerHTML = warn + (r.results.length ? r.results.map((h) => `
+      <div class="docs-hit">
+        <div class="src">${esc(h.path)}${h.headings.length ? ` › ${esc(h.headings.join(" › "))}` : ""} · lines ${h.start_line}–${h.end_line} · score ${h.score}</div>
+        <pre>${esc(h.text)}</pre>
+      </div>`).join("") : `<div class="hint">No matches in ${r.chunks_total} sections.</div>`);
+  } catch (e) { $("docs-results").innerHTML = `<div class="hint err">${esc(e.message)}</div>`; }
+}
+
+function wireDocs() {
+  $("char-docs").addEventListener("click", () => { const c = selectedCharacter(); if (c) openDocs(c); });
+  $("docs-active-char").addEventListener("click", () => { const c = activeCharacter(); if (c) openDocs(c); });
+  $("docs-close").addEventListener("click", closeDocs);
+  $("docs-refresh").addEventListener("click", refreshDocs);
+  $("docs-new").addEventListener("click", newDoc);
+  $("docs-save").addEventListener("click", saveDoc);
+  $("docs-delete").addEventListener("click", deleteDoc);
+  $("docs-open").addEventListener("click", async () => {
+    try { await api(`/api/characters/${docs.cid}/docs/open`, { method: "POST" }); } catch (e) { setDocsMsg(esc(e.message), "err"); }
+  });
+  $("docs-list").addEventListener("click", (ev) => {
+    const li = ev.target.closest("li[data-path]");
+    if (!li || li.dataset.path === docs.cur?.path || !confirmDiscard()) return;
+    loadDoc(li.dataset.path);
+  });
+  $("docs-text").addEventListener("input", updateDocsDirty);
+  $("docs-text").addEventListener("keydown", (ev) => {
+    if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s") { ev.preventDefault(); if (docsDirty()) saveDoc(); }
+  });
+  $("docs-msg").addEventListener("click", (ev) => { if (ev.target.id === "docs-reload" && docs.cur) loadDoc(docs.cur.path); });
+  $("docs-search").addEventListener("click", searchDocs);
+  $("docs-q").addEventListener("keydown", (ev) => { if (ev.key === "Enter") searchDocs(); });
+  window.addEventListener("beforeunload", (ev) => { if (!$("docs").hidden && docsDirty()) { ev.preventDefault(); ev.returnValue = ""; } });
+}
+
 // ------------------------------------------------------------------------------------ wiring
 function wire() {
   const saved = recall("prompt");
@@ -824,9 +976,11 @@ function wire() {
   $("browser-pick-dir").addEventListener("click", (ev) => pickPath(ev.target.dataset.path));
   wireLoras();
   wireCharacters();
+  wireDocs();
   document.addEventListener("keydown", (ev) => {
     if (ev.key !== "Escape") return;
     if (!$("browser").hidden) { $("browser").hidden = true; return; } // the browser can sit on top of the editor
+    if (!$("docs").hidden) { closeDocs(); return; }
     $("settings").hidden = true;
     $("char-editor").hidden = true;
   });

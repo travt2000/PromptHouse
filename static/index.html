@@ -17,6 +17,7 @@
     <div class="row wrap">
       <button id="char-load" class="btn primary">Load</button>
       <button id="char-edit" class="btn">Edit</button>
+      <button id="char-docs" class="btn" title="Character bible, style guide and other documents">Docs</button>
       <button id="char-delete" class="btn danger">Delete</button>
       <span class="spacer"></span>
       <button id="char-new" class="btn">+ New character</button>
@@ -41,7 +42,7 @@
 
     <section class="panel char-bar">
       <div class="panel-head"><h2>Character</h2>
-        <span class="row tight"><button id="edit-active-char" class="btn small" hidden>Edit</button><button id="switch-char" class="btn small">Switch</button></span>
+        <span class="row tight"><button id="docs-active-char" class="btn small" hidden>Docs</button><button id="edit-active-char" class="btn small" hidden>Edit</button><button id="switch-char" class="btn small">Switch</button></span>
       </div>
       <div id="char-name" class="char-name">-</div>
       <div id="char-detail" class="hint"></div>
@@ -170,6 +171,37 @@
       <button id="ce-cancel" class="btn">Cancel</button>
       <button id="ce-save" class="btn primary">Save</button>
     </div>
+  </div>
+</div>
+
+<div id="docs" class="modal" hidden>
+  <div class="modal-card wide">
+    <header class="modal-head"><h2 id="docs-title">Documents</h2><button id="docs-close" class="icon-btn" aria-label="Close">&times;</button></header>
+    <div class="row wrap docs-bar">
+      <span id="docs-folder" class="hint mono docs-folder"></span>
+      <span class="spacer"></span>
+      <button id="docs-open" class="btn small" title="Open this folder in Explorer">Open folder</button>
+      <button id="docs-refresh" class="btn small" title="Re-read the folder (after editing files elsewhere)">Refresh</button>
+      <button id="docs-new" class="btn small">+ New document</button>
+    </div>
+    <div class="docs-body">
+      <ul id="docs-list" class="docs-list"></ul>
+      <div class="docs-editor">
+        <div class="row docs-edit-head">
+          <span id="docs-path" class="mono"></span><span id="docs-dirty" class="hint warn"></span>
+          <span class="spacer"></span>
+          <button id="docs-delete" class="btn small danger" disabled>Delete</button>
+          <button id="docs-save" class="btn small primary" disabled>Save</button>
+        </div>
+        <textarea id="docs-text" spellcheck="true" placeholder="Select a document on the left, or create one." disabled></textarea>
+        <div id="docs-msg" class="hint"></div>
+      </div>
+    </div>
+    <details class="docs-search">
+      <summary>Retrieval preview <span class="hint">— what future LLM features will pull from these documents</span></summary>
+      <div class="row"><input id="docs-q" type="text" placeholder="e.g. what does she wear in summer?"><button id="docs-search" class="btn small">Search</button></div>
+      <div id="docs-results" class="docs-results"></div>
+    </details>
   </div>
 </div>
 

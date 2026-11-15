@@ -100,6 +100,27 @@ While a character is loaded:
   exact prompt that is encoded.
 * Image metadata records the character, the prompt as typed, and whether the trigger was prepended.
 
+### Character documents
+
+Every character has a folder of Markdown documents, `data/characters/<name>/`, created with the character
+(existing characters get theirs on the next start). New folders start with `bible.md`, `style-guide.md`,
+`voice.md`, a `README.md` and a `notes/` folder; the template hints are `<!-- comments -->`. Open them with
+**Docs** (landing page or the Character panel): a file list, a plain-text editor (**Ctrl+S** saves), **+ New
+document** (any `.md` path, subfolders allowed), **Delete**, **Open folder** (Explorer) and **Refresh**.
+
+* The files are ordinary Markdown: edit them in VS Code, Obsidian, etc. too. A save from PromptHouse is refused
+  if the file changed on disk since it was opened (nothing is overwritten silently); **Reload from disk** then
+  shows the other version.
+* The folder name is fixed when the character is created; renaming the character does not move it.
+  Deleting a character keeps its folder.
+* Optional YAML front matter describes a file: `type:` (defaults to the file name), `tags:`, `title:`, and
+  `index: false` to leave a file out of search.
+* **Groundwork for LLM features (no LLM yet):** documents are split into sections by heading, each with a stable
+  id, heading path, line numbers and content hash. `GET /api/characters/{id}/context?q=...` returns the best
+  matching sections (simple keyword ranking, BM25, for now); *Retrieval preview* in the Docs window shows what it
+  finds. Later features (content planning, prompt writing) will call this, with embedding search replacing the
+  keyword ranking behind the same endpoint.
+
 Deleting a character removes only its record, never the LoRA file. The loaded character is not remembered
 across server restarts (the app always starts on the landing page).
 
@@ -111,7 +132,7 @@ plans memory to avoid this and flags it if it happens anyway.
 ## Tests and checks
 
 ```powershell
-.venv\Scripts\python.exe -m pytest -q tests                 # 212 tests; GPU lifecycle tests use tiny modules
+.venv\Scripts\python.exe -m pytest -q tests                 # 235 tests; GPU lifecycle tests use tiny modules
 .venv\Scripts\python.exe scripts\smoke_test.py --repeat 2   # real encode -> sample -> decode, same modules as the app
 .venv\Scripts\python.exe scripts\ui_e2e.py                  # drives the running UI in Edge (needs run.py)
 .venv\Scripts\python.exe scripts\lora_check.py [--full]    # LoRA math on real FP8 layers; --full = real sampling
@@ -122,7 +143,8 @@ plans memory to avoid this and flags it if it happens anyway.
 Unit tests cover dimension calculation, seeds, settings persistence, prompt-cache invalidation and stale
 results, cached-conditioning reuse, rejection of simultaneous GPU jobs, cleanup after exceptions/OOM,
 stage separation/order, FP8 layer math, block streaming equivalence, RAM release, LoRA key formats/rejections,
-LoRA math vs. merged weights, stacking, disable/zero strength, streaming + LoRA, no base reload on stack changes, character storage/validation, trigger prepending, the character LoRA lock.
+LoRA math vs. merged weights, stacking, disable/zero strength, streaming + LoRA, no base reload on stack changes, character storage/validation, trigger prepending, the character LoRA lock,
+document folders (templates, path safety, conflict detection, front matter, chunking, keyword search, DB migration).
 They do **not** prove
 Krea 2 generation — the smoke test and UI test do that with real weights.
 
@@ -141,6 +163,7 @@ Krea 2 generation — the smoke test and UI test do that with real weights.
 | A *trained* Krea 2 LoRA in a full real generation through the UI | ✅ tested manually by the user — loaded a LoRA and generated; worked as expected |
 | Automated full-pipeline LoRA check (`lora_check.py --full`) | not run — needs ~16 GB free RAM. Streaming + LoRA equivalence and "no base reload" are unit-tested with a stand-in model. |
 | Characters: landing page, create/edit/delete, load, locked LoRA, trigger prepend/toggle, free mode, switch, reload | ✅ Edge via Playwright (synthetic LoRAs); API + store unit-tested; character creation and the LoRA lock confirmed manually by the user with a real LoRA. |
+| Character documents: folder per character, edit/save/create/delete, conflict with an external edit, retrieval preview | ✅ Edge via Playwright against a separate test data folder; API and file layer unit-tested; v1 → v2 database migration tested |
 | Real CUDA OOM | handling tested with simulated OOM only; memory planning avoided OOM in all real runs |
 
 ## Known limitations

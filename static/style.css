@@ -150,7 +150,29 @@ label.check { flex-direction: row; align-items: center; gap: 8px; color: var(--t
 #prepend-wrap code { color: var(--accent); }
 .preview { white-space: pre-wrap; word-break: break-word; max-height: 4.5em; overflow: hidden; }
 
+/* character documents */
+.modal-card.wide { width: min(1200px, 100%); height: 92vh; }
+.docs-folder { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.docs-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 260px 1fr; gap: 10px; }
+.docs-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; }
+.docs-list li { padding: 7px 10px; cursor: pointer; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 1px; }
+.docs-list li:hover { background: var(--panel-2); }
+.docs-list li.active { background: color-mix(in srgb, var(--accent-2) 22%, transparent); }
+.docs-list .doc-path { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.docs-list .doc-meta { font-size: 11px; color: var(--muted); }
+.docs-editor { display: flex; flex-direction: column; gap: 6px; min-height: 0; min-width: 0; }
+.docs-edit-head { min-height: 30px; }
+#docs-text { flex: 1; min-height: 200px; resize: none; font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 13px; line-height: 1.5; }
+.docs-search summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+.docs-search > .row { margin-top: 8px; }
+.docs-results { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; max-height: 30vh; overflow-y: auto; }
+.docs-hit { border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; background: #0f1115; font-size: 12px; }
+.docs-hit .src { color: var(--accent); font-size: 11px; }
+.docs-hit pre { margin: 4px 0 0; white-space: pre-wrap; word-break: break-word; font-family: inherit; color: var(--text); max-height: 9em; overflow: hidden; }
+
 @media (max-width: 860px) {
+  .docs-body { grid-template-columns: 1fr; }
+  .docs-list { max-height: 25vh; }
   .app { grid-template-columns: 1fr; height: auto; }
   .sidebar { border-right: none; }
   .viewer { min-height: 60vh; }

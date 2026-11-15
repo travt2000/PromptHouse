@@ -169,3 +169,24 @@ FastAPI endpoints stay responsive during inference (`/api/system` measured at 2 
   `/api/encode` and `/api/generate`, so a character switch after encoding is detected as *Not Encoded*.
 * **Eviction:** after any stack or workspace change, cached adapters not used by the effective stack are freed on
   the GPU worker thread (so the character's LoRA stays cached while it is loaded).
+
+## Character documents (`app/character_docs.py`)
+
+* **Location:** `data/characters/<folder>/` (`PROMPTHOUSE_DATA_DIR` moves all of `data/`). `characters.folder`
+  (schema v2) stores the folder name, chosen once from the name's slug (made unique against folders on disk and in
+  the database). Characters created before v2 get a folder at startup. Templates are written only when a folder is
+  first created.
+* **File access:** every client path goes through `safe_path`: relative, `.md` only, no `..`, no drive letters, no
+  dot-files or dot-folders, at most 6 levels, and it must resolve inside the character's folder (this also stops
+  symlinks that point outside). Files are at most 1 MB and written atomically (temporary file + `os.replace`).
+* **Concurrent edits:** reads return the file's `st_mtime_ns` **as a string**, because nanosecond integers exceed
+  JavaScript's exact number range. A write must send that value back (`expected_mtime`) and is refused with 409 if
+  the file changed; `null` means "create" and is refused if the file exists.
+* **Chunking:** front matter is parsed with `yaml.safe_load` (invalid front matter is reported and ignored).
+  The body is split at Markdown headings (not inside code fences); a section longer than 1500 characters is split at
+  blank lines. HTML comments and heading-only sections are skipped, and so is a file with `index: false`. Each chunk
+  carries `id` (sha1 of folder/path#ordinal), `headings`, `doc_type`, `tags`, `start_line`/`end_line` and `sha256`.
+* **Index:** `DocIndex` caches chunks per (character, file) by (size, mtime) and drops entries for deleted files.
+  `search()` is BM25 over the chunk text, headings, type and tags. `GET /api/characters/{id}/context` is the
+  retrieval interface future LLM features will use; an embedding retriever can replace BM25 there, using `sha256` to
+  re-embed only changed chunks.

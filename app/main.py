@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from . import checkpoints as ck
 from . import config as cfg
 from . import resolution as resmod
+from . import character_docs as cdocs
 from .characters import CharacterError, CharacterStore, Duplicate, NotFound, compose_prompt
 from .conditioning import PromptCache
 from .config import LORA_DIR, MAX_LORAS, MAX_SEED, Settings, SettingsError, load_settings, save_settings, update_settings, validate_models
@@ -39,6 +40,8 @@ class State:
     characters: CharacterStore | None = None
     # None = landing page; {"character_id": int | None} = generation workspace (None id = no character)
     workspace: dict | None = None
+    docs_root: Path
+    doc_index: cdocs.DocIndex
     startup_error: str | None = None
 
 
@@ -61,8 +64,16 @@ async def lifespan(app: FastAPI):
     S.monitor = Monitor()
     S.loras = LoraLibrary()
     S.workspace = None
+    S.docs_root = Path(cfg.CHARACTER_DOCS_DIR)
+    S.doc_index = cdocs.DocIndex()
     try:
         S.characters = CharacterStore(cfg.DB_FILE)
+        for c in S.characters.list():  # characters created before document folders existed
+            if not c["folder"]:
+                try:
+                    _provision_folder(c)
+                except OSError as e:
+                    log.warning("could not create the document folder for %s: %s", c["name"], e)
     except Exception as e:  # noqa: BLE001 - a broken DB must not take down generation
         S.characters = None
         S.startup_error = f"Character database unavailable ({e})"
@@ -304,8 +315,16 @@ def _evict_unused() -> None:
         S.runner.defer_to_worker(lambda: S.loras.evict_except(keep))
 
 
+def _provision_folder(c: dict) -> dict:
+    taken = {x["folder"] for x in S.characters.list() if x["folder"]}
+    folder = cdocs.allocate_folder(S.docs_root, c["name"], taken)
+    cdocs.provision(S.docs_root, folder, c["name"])
+    return S.characters.set_folder(c["id"], folder)
+
+
 def _character_view(c: dict) -> dict:
     out = dict(c)
+    out["docs_dir"] = str(S.docs_root / c["folder"]) if c["folder"] else None
     out["lora_info"] = S.loras.inspect(c["lora_path"]).to_dict() if c["lora_path"] else None
     return out
 
@@ -337,7 +356,13 @@ def list_characters():
 def create_character(body: dict):
     store = _store()
     _check_character_lora(body.get("lora_path"))
-    return _character_view(_character_call(lambda: store.create(body)))
+    c = _character_call(lambda: store.create(body))
+    try:
+        c = _provision_folder(c)
+    except (OSError, cdocs.DocError) as e:
+        store.delete(c["id"])  # do not leave a character without its folder
+        raise HTTPException(500, f"Could not create the character's document folder: {e}") from e
+    return _character_view(c)
 
 
 @app.get("/api/characters/{cid}")
@@ -359,11 +384,96 @@ def update_character(cid: int, body: dict):
 @app.delete("/api/characters/{cid}")
 def delete_character(cid: int):
     store = _store()
-    _character_call(lambda: store.delete(cid))  # never touches the LoRA file itself
+    c = _character_call(lambda: store.get(cid))
+    _character_call(lambda: store.delete(cid))  # never touches the LoRA file or the document folder
+    S.doc_index.forget(cid)
     if S.workspace and S.workspace.get("character_id") == cid:
         S.workspace = None
         _evict_unused()
-    return {"deleted": cid, "workspace": _workspace_view()}
+    kept = str(S.docs_root / c["folder"]) if c["folder"] and (S.docs_root / c["folder"]).exists() else None
+    return {"deleted": cid, "docs_kept": kept, "workspace": _workspace_view()}
+
+
+# ------------------------------------------------------------------------------------------ character documents
+
+
+def _docs_folder(cid: int) -> tuple[dict, Path]:
+    store = _store()
+    c = _character_call(lambda: store.get(cid))
+    if not c["folder"]:
+        try:
+            c = _provision_folder(c)
+        except (OSError, cdocs.DocError) as e:
+            raise HTTPException(500, f"Could not create the character's document folder: {e}") from e
+    d = S.docs_root / c["folder"]
+    if not d.is_dir():  # removed outside the app: recreate it empty (templates are only for new characters)
+        d.mkdir(parents=True, exist_ok=True)
+    return c, d
+
+
+def _doc_call(fn):
+    try:
+        return fn()
+    except cdocs.DocConflict as e:
+        raise HTTPException(409, str(e)) from e
+    except cdocs.DocError as e:
+        raise HTTPException(400, str(e)) from e
+    except FileNotFoundError as e:
+        raise HTTPException(404, f"Not found: {e}") from e
+    except OSError as e:
+        raise HTTPException(500, f"File error: {e}") from e
+
+
+@app.get("/api/characters/{cid}/docs")
+def list_character_docs(cid: int):
+    c, d = _docs_folder(cid)
+    return {"character_id": cid, "folder": str(d), "files": _doc_call(lambda: cdocs.list_docs(d))}
+
+
+@app.get("/api/characters/{cid}/docs/file")
+def read_character_doc(cid: int, path: str = Query(...)):
+    _, d = _docs_folder(cid)
+    return _doc_call(lambda: cdocs.read_doc(d, path))
+
+
+class DocWrite(BaseModel):
+    path: str
+    content: str = Field(..., max_length=cdocs.MAX_DOC_BYTES)
+    expected_mtime: str | None = None  # from the last read/write; None = create a new file (must not exist)
+
+
+@app.put("/api/characters/{cid}/docs/file")
+def write_character_doc(cid: int, body: DocWrite):
+    _, d = _docs_folder(cid)
+    return _doc_call(lambda: cdocs.write_doc(d, body.path, body.content, body.expected_mtime))
+
+
+@app.delete("/api/characters/{cid}/docs/file")
+def delete_character_doc(cid: int, path: str = Query(...)):
+    _, d = _docs_folder(cid)
+    _doc_call(lambda: cdocs.delete_doc(d, path))
+    return {"deleted": path}
+
+
+@app.post("/api/characters/{cid}/docs/open")
+def open_character_folder(cid: int):
+    """Open the folder in the OS file manager (this is a local, single-user app bound to 127.0.0.1)."""
+    _, d = _docs_folder(cid)
+    if not hasattr(os, "startfile"):
+        raise HTTPException(501, f"Opening folders is only supported on Windows. Folder: {d}")
+    os.startfile(d)  # noqa: S606 - fixed path under the documents root
+    return {"opened": str(d)}
+
+
+@app.get("/api/characters/{cid}/context")
+def character_context(cid: int, q: str = Query("", max_length=2000), k: int = Query(5, ge=1, le=50)):
+    """Retrieval groundwork: the character's documents as chunks, and the best matches for `q`.
+    Lexical (BM25) for now; this is the call future LLM features will use to fetch context."""
+    c, _ = _docs_folder(cid)
+    chunks, warnings = S.doc_index.chunks(cid, S.docs_root, c["folder"])
+    hits = cdocs.DocIndex.search(chunks, q, k) if q.strip() else []
+    return {"character_id": cid, "retriever": "bm25", "chunks_total": len(chunks), "warnings": warnings,
+            "results": [{**ch.to_dict(), "score": score} for ch, score in hits]}
 
 
 class WorkspaceRequest(BaseModel):
