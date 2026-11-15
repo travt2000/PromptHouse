@@ -115,8 +115,8 @@ Krea 2 generation — the smoke test and UI test do that with real weights.
 | **BF16 transformer checkpoint** (`krea2_turbo_bf16.safetensors`) | ❌ **not verified — incomplete acceptance item.** The loader path is implemented (same code as FP8 minus `FP8Linear`), but no BF16 transformer file is present, and its ~24.5 GB of weights would need ~26 GB of free RAM for the RAM-resident streaming design; this machine typically has ~18 GB free. |
 | LoRA: key formats, math on **real FP8 checkpoint layers** (blocks 0 and 27) on the GPU | ✅ `scripts/lora_check.py`: matches merged-weight reference within BF16 rounding (rel. 2.9e-3); 3 layouts identical; strength 0 bit-identical; base weights unchanged |
 | LoRA panel (add/refuse incompatible/duplicate, strength, disable, reorder by arrows and drag, persist, remove) | ✅ Edge via Playwright |
-| LoRA in a full real generation (`lora_check.py --full`) | ❌ **not run yet** — needs ~16 GB free RAM; 13.9 GB were free. Streaming + LoRA equivalence and "no base reload" are unit-tested with a stand-in model only. |
-| A *trained* Krea 2 LoRA | ❌ not tested — none on this machine; only synthetic random adapters were used |
+| A *trained* Krea 2 LoRA in a full real generation through the UI | ✅ tested manually by the user — loaded a LoRA and generated; worked as expected |
+| Automated full-pipeline LoRA check (`lora_check.py --full`) | not run — needs ~16 GB free RAM. Streaming + LoRA equivalence and "no base reload" are unit-tested with a stand-in model. |
 | Real CUDA OOM | handling tested with simulated OOM only; memory planning avoided OOM in all real runs |
 
 ## Known limitations
