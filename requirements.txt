@@ -1,0 +1,17 @@
+# Known-working set (Windows 11, Python 3.12.7, RTX 5070 / Blackwell sm_120, NVIDIA driver 610.88).
+# Install PyTorch first from the CUDA 12.8 index (Blackwell needs CUDA >= 12.8):
+#   pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0
+transformers==4.57.1      # version pinned by the official krea-2 repo; provides Qwen3VLModel
+diffusers==0.39.0         # AutoencoderKLQwenImage + convert_wan_vae_to_diffusers
+accelerate==1.15.0        # init_empty_weights for meta-device construction
+safetensors==0.8.0
+tokenizers==0.22.2
+einops==0.8.2
+numpy==2.5.4
+pillow==13.0.0
+fastapi==0.163.0
+uvicorn[standard]==0.54.0
+pydantic==2.14.3
+psutil==7.2.2
+nvidia-ml-py==13.615.71   # NVML bindings (import name: pynvml)

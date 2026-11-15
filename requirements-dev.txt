@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest==9.2.0
+httpx==0.28.1        # FastAPI TestClient
+playwright==1.65.2   # scripts/ui_e2e.py drives the locally installed Microsoft Edge (no browser download)

@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Krea 2 Turbo</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <header class="brand">
+      <div class="brand-title">Krea 2 <span>Turbo</span></div>
+      <button id="open-settings" class="icon-btn" title="Settings" aria-label="Settings">
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M19.14 12.94a7.07 7.07 0 0 0 .05-.94 7.07 7.07 0 0 0-.05-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.03 7.03 0 0 0-1.63-.94l-.36-2.54A.5.5 0 0 0 13.9 2.4h-3.84a.5.5 0 0 0-.49.42l-.36 2.54c-.59.24-1.13.56-1.63.94l-2.39-.96a.5.5 0 0 0-.6.22L2.67 8.88a.5.5 0 0 0 .12.64l2.03 1.58a7.4 7.4 0 0 0 0 1.88l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32c.13.22.39.3.6.22l2.39-.96c.5.38 1.04.7 1.63.94l.36 2.54c.04.24.25.42.49.42h3.84c.24 0 .45-.18.49-.42l.36-2.54c.59-.24 1.13-.56 1.63-.94l2.39.96c.22.08.47 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58ZM12 15.6a3.6 3.6 0 1 1 0-7.2 3.6 3.6 0 0 1 0 7.2Z"/></svg>
+      </button>
+    </header>
+
+    <div id="startup-error" class="banner error" hidden></div>
+
+    <section class="panel">
+      <h2>Prompt</h2>
+      <textarea id="prompt" rows="4" placeholder="Describe the image..." spellcheck="true"></textarea>
+      <div class="row">
+        <button id="encode-btn" class="btn">Encode Prompt</button>
+        <span id="encode-state" class="pill">Not Encoded</span>
+      </div>
+      <div id="encode-detail" class="hint"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Resolution</h2>
+      <div class="grid2">
+        <label>Aspect ratio<select id="aspect"></select></label>
+        <label>Megapixels<select id="megapixels"></select></label>
+      </div>
+      <label>Dimension multiple<select id="multiple"></select></label>
+      <div class="dims">
+        <div><span class="k">Size</span><span id="dims" class="v">-</span></div>
+        <div><span class="k">Actual</span><span id="actual-mp" class="v">-</span></div>
+      </div>
+      <div id="res-warnings" class="hint warn"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h2>LoRA</h2><span id="lora-count" class="hint"></span></div>
+      <ul id="lora-list" class="lora-list"></ul>
+      <button id="add-lora" class="btn small">+ Add LoRA</button>
+      <div id="lora-msg" class="hint"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Generation</h2>
+      <button id="generate-btn" class="btn primary" disabled>Generate Image</button>
+      <div class="kv"><span class="k">Status</span><span id="gen-status" class="v">Idle</span></div>
+      <div class="kv"><span class="k">Stage</span><span id="gen-stage" class="v">-</span></div>
+      <div class="progress" id="progress-wrap" hidden><div id="progress-bar"></div><span id="progress-text"></span></div>
+      <div class="kv"><span class="k">Seed</span><span id="gen-seed" class="v">-</span></div>
+      <div id="seed-mode" class="hint"></div>
+    </section>
+
+    <section class="panel monitor">
+      <h2>System</h2>
+      <div id="gpu-name" class="hint mono">-</div>
+      <div class="meter"><div class="meter-label"><span>VRAM</span><span id="vram-text">-</span></div><div class="bar"><div id="vram-bar"></div></div></div>
+      <div class="meter"><div class="meter-label"><span>GPU</span><span id="gpu-text">-</span></div><div class="bar"><div id="gpu-bar"></div></div></div>
+      <div class="meter"><div class="meter-label"><span>RAM</span><span id="ram-text">-</span></div><div class="bar"><div id="ram-bar"></div></div></div>
+      <div class="meter"><div class="meter-label"><span>CPU</span><span id="cpu-text">-</span></div><div class="bar"><div id="cpu-bar"></div></div></div>
+      <div id="residency" class="residency"></div>
+    </section>
+  </aside>
+
+  <main class="stage">
+    <div id="viewer" class="viewer empty">
+      <div id="placeholder" class="placeholder">Encode a prompt, then generate an image.</div>
+      <img id="image" alt="Generated image" hidden>
+      <div id="overlay" class="overlay" hidden><div class="spinner"></div><div id="overlay-text"></div></div>
+    </div>
+    <div id="error-box" class="banner error" hidden></div>
+    <div class="image-meta">
+      <span id="image-info"></span>
+      <a id="download" class="btn small" hidden>Download PNG</a>
+    </div>
+  </main>
+</div>
+
+<div id="settings" class="modal" hidden>
+  <div class="modal-card">
+    <header class="modal-head">
+      <h2>Settings</h2>
+      <button id="close-settings" class="icon-btn" aria-label="Close">&times;</button>
+    </header>
+    <p class="hint">Paths refer to files on <strong>this server's</strong> filesystem. Single-file <code>.safetensors</code> checkpoints (BF16 or scaled FP8). Nothing is downloaded.</p>
+    <div id="model-fields"></div>
+
+    <h3>Seed</h3>
+    <div class="grid2">
+      <label>Seed<input id="seed" type="number" min="0" step="1"></label>
+      <label class="check"><input id="randomize" type="checkbox"> Randomize seed for each image</label>
+    </div>
+
+    <h3>System RAM caching</h3>
+    <p class="hint">Keep a component's weights in system RAM between operations (faster; models on an HDD take minutes to re-read). Unchecked = released from RAM after each use.</p>
+    <div class="checks">
+      <label class="check"><input type="checkbox" data-keep="text_encoder"> Text encoder</label>
+      <label class="check"><input type="checkbox" data-keep="transformer"> Transformer</label>
+      <label class="check"><input type="checkbox" data-keep="vae"> VAE</label>
+    </div>
+
+    <div id="settings-msg" class="hint"></div>
+    <div class="row end">
+      <button id="save-settings" class="btn primary">Save</button>
+    </div>
+  </div>
+</div>
+
+<div id="browser" class="modal" hidden>
+  <div class="modal-card narrow">
+    <header class="modal-head"><h2>Select file</h2><button id="close-browser" class="icon-btn" aria-label="Close">&times;</button></header>
+    <div id="browser-path" class="hint mono"></div>
+    <ul id="browser-list" class="browser-list"></ul>
+    <div class="row end"><button id="browser-pick-dir" class="btn small" hidden>Use this folder</button></div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
