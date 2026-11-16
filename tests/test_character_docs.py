@@ -195,6 +195,8 @@ def _client(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "SETTINGS_FILE", tmp_path / "settings.json")
     monkeypatch.setattr(config, "DB_FILE", tmp_path / "chars.db")
     monkeypatch.setattr(config, "CHARACTER_DOCS_DIR", tmp_path / "characters")
+    monkeypatch.setattr(config, "STYLE_THUMBS_DIR", tmp_path / "style_thumbs")
+    monkeypatch.setattr(config, "LLAMA_LOG_FILE", tmp_path / "logs" / "llama-server.log")
     from app.main import app
 
     return TestClient(app)
@@ -211,7 +213,7 @@ def test_existing_v1_characters_get_folders_on_startup(tmp_path, monkeypatch):
         assert ch["folder"] == "bailey-bell" and ch["docs_dir"] == str(tmp_path / "characters" / "bailey-bell")
         assert (tmp_path / "characters" / "bailey-bell" / "bible.md").is_file()
     with sqlite3.connect(tmp_path / "chars.db") as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == len(__import__("app.characters", fromlist=["x"])._MIGRATIONS)
 
 
 @needs_cuda

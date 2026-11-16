@@ -121,7 +121,66 @@ document** (any `.md` path, subfolders allowed), **Delete**, **Open folder** (Ex
   finds. Later features (content planning, prompt writing) will call this, with embedding search replacing the
   keyword ranking behind the same endpoint.
 
-Deleting a character removes only its record, never the LoRA file. The loaded character is not remembered
+### Style analysis (merged from StyleHouse)
+
+**Style** (landing page or the Character panel) opens a character's two image libraries, each read image by
+image by a local vision model into a structured record:
+
+| Library | Images | What is recorded | Guide |
+|---|---|---|---|
+| **Character images** | the character itself | hair, eyes, skin tone/undertone, face shape, build; seasonal colour analysis; what flatters them; on-camera habits; styling recommendations | **Self-Style Guide** |
+| **Inspiration** | content the character should make | format, themes, camera, light, pose, outfit, setting, mood — **never the subject's physical traits** | **Content Guide** |
+
+* **Scan folder** registers a folder's images (files are only read; exact duplicates skipped, near-duplicates
+  flagged). **Analyze pending** runs the model over images not yet analyzed with the current model and schema
+  (resume-safe, cancellable); **Re-analyze all** redoes them. Tick images (shift-click for a range) to remove
+  them from a library; a rescan skips removed images unless **Re-add removed** is ticked.
+* An inspiration image already analyzed for another character (same file, model and schema) reuses that
+  analysis instead of running the model again.
+* **Write guide**: the analyses are tallied in code (signature ≥60 %, common ≥25 %; character images weighted by
+  the model's own confidence), then the model writes the guide from the tally and the character's **type**
+  (Influencer, Fashion Model, Cosplay… from `config/character_types.json`, editable, re-read on every load; set it
+  in the character editor or the Style window). An appendix with the exact numbers is added by code.
+* **Guides land in the character's documents**: `guides/self-style-guide.md` and `guides/content-guide.md`, with
+  front matter, so they are editable in Docs and found by the retrieval endpoint. Writing a new guide first
+  archives the current file (including your edits) to `guides/archive/…` with `index: false`. Every version and its
+  raw tally also stay in the database.
+* **The vision model** is `llama-server` from llama.cpp, configured in **Settings → Style analysis**: the
+  executable, a vision-capable model `.gguf` and its matching `mmproj` `.gguf` (nothing is downloaded), or the URL
+  of an already-running OpenAI-compatible server. It is started for each job and stopped afterwards, which frees
+  its VRAM and RAM. Style jobs run on the same GPU worker as generation, so the two never overlap: generation is
+  refused while a style job runs and vice versa. By default the Krea weights are also freed from system RAM
+  before the vision model starts (the next generation re-reads them from disk; untick to keep them).
+* Deleting a character deletes its libraries, analyses and guide history from the database; image files and the
+  document folder (including written guides) stay on disk.
+
+### Prompts from the guides
+
+With a character loaded, the Prompt panel has **Write prompts**: the same local model reads the character's
+current guides (`guides/self-style-guide.md` and `guides/content-guide.md` in its documents, including any edits
+you made) and writes 1–8 distinct Krea prompts, optionally steered by an idea ("rainy city night"). Click **Use**
+to put one in the prompt box; nothing is encoded or generated until you do that yourself. The last prompts are kept
+per character in the browser.
+
+* Either guide is enough; with neither, you are asked to write one in the Style window first.
+* The model is told to describe the character with the guide's appearance keywords, never by name, and to leave
+  out the trigger word (it is still prepended as usual). The data appendix and the "Gaps" sections are left out;
+  the prompt-keyword sections are sent first so they survive trimming to the context size.
+* It is a text-only job: llama-server starts **without** the vision projector (less to load, less VRAM), so only
+  the executable and model GGUF need to be set. Like style jobs it runs on the GPU worker, frees the Krea weights
+  first (if that option is on) and stops the server afterwards, so expect the model load time on every click;
+  ask for several prompts at once. *Prompt-writing max tokens/temperature* are under Settings → Style analysis →
+  Advanced (defaults 1536 / 0.9).
+
+### Editing the prompts
+
+Everything sent to the local model (the image-analysis, guide-writing and prompt-writing instructions) is in
+Markdown files in [`prompts/`](prompts/README.md), not in the code. Edit a file and the next request uses it, without
+a restart. The files use a small template syntax (`{{variable}}`, `{{#flag}}…{{/flag}}`, `{{> other-file}}`,
+`<!-- notes -->`), documented in `prompts/README.md`. The `## ` headings in `prompts/guides/*.system.md` define the
+guides' sections. The data tally inside the guide request is still formatted by code (`app/style/aggregate.py`).
+
+Deleting a character never removes the LoRA file. The loaded character is not remembered
 across server restarts (the app always starts on the landing page).
 
 **Windows tip:** in NVIDIA Control Panel → Manage 3D settings → Program settings → `python.exe`, set
@@ -132,7 +191,7 @@ plans memory to avoid this and flags it if it happens anyway.
 ## Tests and checks
 
 ```powershell
-.venv\Scripts\python.exe -m pytest -q tests                 # 235 tests; GPU lifecycle tests use tiny modules
+.venv\Scripts\python.exe -m pytest -q tests                 # 323 tests; GPU lifecycle tests use tiny modules
 .venv\Scripts\python.exe scripts\smoke_test.py --repeat 2   # real encode -> sample -> decode, same modules as the app
 .venv\Scripts\python.exe scripts\ui_e2e.py                  # drives the running UI in Edge (needs run.py)
 .venv\Scripts\python.exe scripts\lora_check.py [--full]    # LoRA math on real FP8 layers; --full = real sampling
@@ -144,7 +203,11 @@ Unit tests cover dimension calculation, seeds, settings persistence, prompt-cach
 results, cached-conditioning reuse, rejection of simultaneous GPU jobs, cleanup after exceptions/OOM,
 stage separation/order, FP8 layer math, block streaming equivalence, RAM release, LoRA key formats/rejections,
 LoRA math vs. merged weights, stacking, disable/zero strength, streaming + LoRA, no base reload on stack changes, character storage/validation, trigger prepending, the character LoRA lock,
-document folders (templates, path safety, conflict detection, front matter, chunking, keyword search, DB migration).
+document folders (templates, path safety, conflict detection, front matter, chunking, keyword search, DB migration),
+style analysis (schemas, record parsing and validation, scanning/dedup/removal, analysis reuse, aggregation, guide
+prompts and assembly, prompt writing from the guides (guide extraction, trimming, reply parsing, text-only
+server start), publishing into the documents with archiving, the real llama-server start/stop/crash/cancel
+lifecycle against a fake server, structured-output fallback, the GPU worker being held during a style job).
 They do **not** prove
 Krea 2 generation — the smoke test and UI test do that with real weights.
 
@@ -164,6 +227,10 @@ Krea 2 generation — the smoke test and UI test do that with real weights.
 | Automated full-pipeline LoRA check (`lora_check.py --full`) | not run — needs ~16 GB free RAM. Streaming + LoRA equivalence and "no base reload" are unit-tested with a stand-in model. |
 | Characters: landing page, create/edit/delete, load, locked LoRA, trigger prepend/toggle, free mode, switch, reload | ✅ Edge via Playwright (synthetic LoRAs); API + store unit-tested; character creation and the LoRA lock confirmed manually by the user with a real LoRA. |
 | Character documents: folder per character, edit/save/create/delete, conflict with an external edit, retrieval preview | ✅ Edge via Playwright against a separate test data folder; API and file layer unit-tested; v1 → v2 database migration tested |
+| Style analysis UI: configure vision model, scan, analyze, detail view, write guide → opens in Docs, inspiration tab, remove | ✅ Edge via Playwright against a separate test data folder, with a **fake** llama-server |
+| Write prompts from guides UI: no-guides error, write, pick, reload, settings fields | ✅ Edge via Playwright against a separate test data folder, with a **fake** llama-server |
+| Prompt writing with a **real** model | ❌ **not verified yet** (prompt quality, and the real llama-server starting text-only without `--mmproj`) |
+| Style analysis with a **real** vision model inside PromptHouse | ✅ confirmed by the user (2026-11-15): guides generated with their local Gemma 4 model "working well". Not re-measured by the automated tests, which use the fake server. |
 | Real CUDA OOM | handling tested with simulated OOM only; memory planning avoided OOM in all real runs |
 
 ## Known limitations
@@ -177,4 +244,5 @@ Krea 2 generation — the smoke test and UI test do that with real weights.
 * LoRA: transformer only (text-encoder LoRA weights are ignored and reported); standard LoRA only (no LoHa/LoKr/DoRA).
   Adapter tensors are fully GPU-resident during sampling and counted in the VRAM plan, so a large stack means
   fewer resident transformer blocks (slightly slower), never an over-allocation.
+* Style analysis processes images one at a time; folder selection is a typed or browsed server-side path.
 * Pinned the official Krea dependency `transformers==4.57.1`; other versions are untested.

@@ -190,3 +190,35 @@ FastAPI endpoints stay responsive during inference (`/api/system` measured at 2 
   `search()` is BM25 over the chunk text, headings, type and tags. `GET /api/characters/{id}/context` is the
   retrieval interface future LLM features will use; an embedding retriever can replace BM25 there, using `sha256` to
   re-embed only changed chunks.
+
+## Style analysis (`app/style/`, merged from StyleHouse)
+
+* **Modules:** `schema.py` (versioned JSON schemas, one per library kind, mostly enums with `unknown`),
+  `kinds.py` (prompt + schema per kind), `analyzer.py` (image → record over an OpenAI-compatible chat endpoint;
+  `json_schema` → `json_object` → prompt-only fallback on HTTP 400; validated with `jsonschema`, one retry),
+  `aggregate.py` (deterministic tally), `guides.py` (guide prompt, model call, header/appendix assembly),
+  `llama_server.py` (hidden `llama-server` subprocess bound to 127.0.0.1, health-polled, always stopped),
+  `scanner.py`, `store.py`, `publish.py`, `runner.py`, `vsettings.py`, `character_types.py`.
+* **Storage:** schema v3 of `prompthouse.db` adds `characters.character_type` and `style_images` (per character and
+  kind, unique by content hash), `style_analyses` (per image, schema version and model label; `reused_from` when
+  copied from the same file in another character's library), `style_removed` and `style_guides`. All cascade
+  from `characters`. Thumbnails are cached by hash in `data/style_thumbs/`.
+* **GPU discipline:** a style job is submitted to the GPU worker with `JobRunner.submit_task` as a job of kind
+  `vision`, so encode/generate get `Busy` while it runs. On the worker it calls
+  `ModelManager.make_room_for_external` (empty the CUDA cache; optionally release all Krea weights from RAM and
+  evict LoRA adapters), starts llama-server, works, and stops the server in `finally`. App shutdown cancels the
+  job and stops the server.
+* **Guides → documents:** `publish.py` writes `guides/<name>.md` through `character_docs.write_doc` (atomic,
+  mtime-checked), archiving the previous file as `guides/archive/<name>-<timestamp>.md` with `index: false`.
+* **Prompts from guides:** `prompts.py` reads the current guide files from the documents folder (front matter,
+  comments, the appendix and "Gaps" sections dropped; "prompt" sections first), builds one text-only request, and
+  parses the numbered list in the reply. `POST /api/characters/{id}/prompts` starts it as a `prompts` job on the
+  same `StyleRunner` (kind `None`, `vision=False`: llama-server is started without `--mmproj`); the result is
+  `status()["prompts"]`, which the generator page picks up from `/api/status`.
+* **Prompt files:** no LLM-facing text is in the code. `app/prompt_files.py` renders `prompts/<name>.md` (a
+  Mustache subset: variables, `#`/`^` sections, `>` includes, HTML comments stripped, standalone tag lines
+  removed). Files are cached by mtime and size, so edits apply on the next request. An unknown variable raises
+  `PromptFileError`. `Kind.system_prompt`/`user_prompt()` and `GuideSpec.system_prompt`/`sections` are read from
+  the files. A guide's sections are the `## ` headings of its system prompt, so the prompt and the
+  "missing sections" check cannot drift apart. The move was checked byte-for-byte: the 120 rendered requests are
+  identical to those built by the old in-code strings.

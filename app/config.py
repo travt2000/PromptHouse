@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from . import checkpoints as ck
+from .style import vsettings as vs
 
 ROOT = Path(__file__).resolve().parent.parent
 SETTINGS_FILE = ROOT / "settings.json"
@@ -22,6 +23,8 @@ LORA_DIR = ROOT / "models" / "loras"
 DATA_DIR = Path(os.environ.get("PROMPTHOUSE_DATA_DIR") or ROOT / "data")
 DB_FILE = DATA_DIR / "prompthouse.db"  # characters (SQLite)
 CHARACTER_DOCS_DIR = DATA_DIR / "characters"  # one Markdown folder per character
+STYLE_THUMBS_DIR = DATA_DIR / "style_thumbs"  # thumbnails of style-library images (by content hash)
+LLAMA_LOG_FILE = DATA_DIR / "logs" / "llama-server.log"  # output of the vision model server (last run)
 MAX_LORAS = 16
 LORA_STRENGTH_LIMIT = 5.0
 
@@ -41,6 +44,11 @@ class Settings:
     keep_in_ram: dict = field(default_factory=lambda: {"text_encoder": False, "transformer": True, "vae": True})
     # Ordered LoRA stack: [{"path": str, "strength": float, "enabled": bool}]
     loras: list = field(default_factory=list)
+    # Style analysis: the vision model (llama-server + GGUF) settings, see app/style/vsettings.py
+    vision: dict = field(default_factory=lambda: vs.merge(None, {}))
+
+    def vision_settings(self) -> vs.VisionSettings:
+        return vs.from_dict(self.vision)
 
     def model_fields(self) -> dict:
         return {k: getattr(self, k) for k in ("transformer_path", "text_encoder_path", "text_encoder_config_dir", "vae_path")}
@@ -53,7 +61,7 @@ class SettingsError(ValueError):
 _lock = threading.Lock()
 
 
-def _coerce(data: dict, base: Settings) -> Settings:
+def _coerce(data: dict, base: Settings, strict: bool = True) -> Settings:
     s = Settings(**asdict(base))
     for key in ("transformer_path", "text_encoder_path", "text_encoder_config_dir", "vae_path"):
         if key in data:
@@ -80,6 +88,11 @@ def _coerce(data: dict, base: Settings) -> Settings:
         s.keep_in_ram = {**s.keep_in_ram, **k}
     if "loras" in data:
         s.loras = coerce_lora_stack(data["loras"])
+    if "vision" in data:  # partial updates merge into the stored section; a damaged file falls back to defaults
+        try:
+            s.vision = vs.merge(s.vision, data["vision"], strict=strict)
+        except vs.VisionSettingsError as e:
+            raise SettingsError(str(e)) from e
     return s
 
 
@@ -121,7 +134,7 @@ def load_settings(path: Path | None = None) -> Settings:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as e:
             raise SettingsError(f"{path.name} is unreadable: {e}") from e
-        return _coerce(data, Settings())
+        return _coerce(data, Settings(), strict=False)
 
 
 def save_settings(s: Settings, path: Path | None = None) -> None:

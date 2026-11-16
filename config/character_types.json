@@ -1,0 +1,71 @@
+{
+  "_comment": [
+    "Character types offered in the 'My character' tab. Edit freely; reload the page to see changes.",
+    "id: stable key stored in settings (lowercase letters, digits, underscores). Don't rename one that is in use.",
+    "label: shown in the dropdown. description: shown under it.",
+    "guidance: not used by per-image analysis; the guide-building stage uses it to shape the self-style and content guides.",
+    "Keys starting with '_' and any other unknown keys are ignored."
+  ],
+  "character_types": [
+    {
+      "id": "influencer",
+      "label": "Influencer",
+      "description": "Lifestyle-led personal brand: relatable, aspirational, consistent across many posts.",
+      "guidance": "Favour a recognisable, repeatable signature look that works in everyday settings and phone-camera light. Balance aspiration with approachability."
+    },
+    {
+      "id": "fashion_model",
+      "label": "Fashion Model",
+      "description": "Editorial and commercial fashion work where the clothes and silhouette lead.",
+      "guidance": "Prioritise silhouettes, proportions, posing range and versatility across styles over a single fixed look. Hair and makeup should stay adaptable."
+    },
+    {
+      "id": "cosplay",
+      "label": "Cosplay Character",
+      "description": "Portrays existing or original characters through costume, wig and makeup.",
+      "guidance": "Treat the base look as a canvas: note which features help or hinder transformation (face shape, build, colouring) and which costume and wig colours suit them out of character."
+    },
+    {
+      "id": "fitness",
+      "label": "Fitness Creator",
+      "description": "Training, sport and active lifestyle content.",
+      "guidance": "Emphasise activewear, movement-friendly styling, energetic posing and settings like gyms and outdoors. Hair and makeup should read as low-maintenance."
+    },
+    {
+      "id": "beauty",
+      "label": "Beauty Creator",
+      "description": "Makeup, skincare and hair content, often in close-up.",
+      "guidance": "Weight colour analysis, skin undertone and face shape heavily. Close-up framing and flattering light matter more than full outfits."
+    },
+    {
+      "id": "glamour",
+      "label": "Glamour Model",
+      "description": "Polished, sensual, high-gloss imagery.",
+      "guidance": "Lean into dramatic light, confident posing, luxurious settings and a polished hair and makeup finish."
+    },
+    {
+      "id": "alternative",
+      "label": "Alternative / Alt Creator",
+      "description": "Goth, punk, grunge, e-girl and other subculture aesthetics.",
+      "guidance": "Build the style around subculture signifiers (dark palettes, layering, statement hair and makeup) while keeping what flatters the character's colouring."
+    },
+    {
+      "id": "lifestyle_travel",
+      "label": "Lifestyle / Travel Creator",
+      "description": "Destinations, daily life, food and experiences.",
+      "guidance": "Favour candid, environmental framing and outfits that suit varied locations and climates. The setting is often the co-star."
+    },
+    {
+      "id": "performer",
+      "label": "Musician / Performer",
+      "description": "Artist persona built around music, stage and performance.",
+      "guidance": "Develop a distinctive persona look that reads on stage and in promo shots; allow bolder statements than everyday styling."
+    },
+    {
+      "id": "virtual_idol",
+      "label": "Virtual Idol / VTuber",
+      "description": "A stylised character persona, often anime-inspired.",
+      "guidance": "Keep the look highly consistent and iconic: signature hair, a defined colour scheme and recognisable outfit motifs."
+    }
+  ]
+}

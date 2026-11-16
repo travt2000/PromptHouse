@@ -2,8 +2,9 @@
 
 A character is the unit the rest of the app will grow around. For now it holds:
   name (unique, case-insensitive), description, an optional LoRA (path + default strength),
-  a trigger phrase, whether that trigger is prepended to prompts by default, and the name of its
-  Markdown document folder (see app/character_docs.py).
+  a trigger phrase, whether that trigger is prepended to prompts by default, the name of its
+  Markdown document folder (see app/character_docs.py) and its character type (config/character_types.json).
+Schema v3 also holds the style libraries (images, vision-model analyses, guide history; see app/style/store.py).
 
 Schema changes are applied in order by `_MIGRATIONS`, tracked with SQLite's `PRAGMA user_version`.
 """
@@ -24,7 +25,8 @@ DESCRIPTION_MAX = 10_000
 PATH_MAX = 1024
 STRENGTH_LIMIT = 5.0
 
-FIELDS = ("name", "description", "lora_path", "lora_strength", "trigger", "prepend_trigger")
+FIELDS = ("name", "description", "lora_path", "lora_strength", "trigger", "prepend_trigger", "character_type")
+TYPE_ID_RE = re.compile(r"^[a-z0-9_]{0,64}$")
 
 _MIGRATIONS = [
     # v1
@@ -44,6 +46,64 @@ _MIGRATIONS = [
     # v2: per-character document folder (name under the documents root; '' = not provisioned yet)
     """
     ALTER TABLE characters ADD COLUMN folder TEXT NOT NULL DEFAULT '';
+    """,
+    # v3: character type + style libraries (per character: images of the character and inspiration images,
+    # their vision-model analyses, and the history of guides written from them)
+    """
+    ALTER TABLE characters ADD COLUMN character_type TEXT NOT NULL DEFAULT '';
+    CREATE TABLE style_images (
+        id           INTEGER PRIMARY KEY,
+        character_id INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+        kind         TEXT    NOT NULL CHECK (kind IN ('character', 'inspiration')),
+        path         TEXT    NOT NULL,
+        sha256       TEXT    NOT NULL,
+        width        INTEGER NOT NULL,
+        height       INTEGER NOT NULL,
+        dhash        TEXT    NOT NULL,
+        near_dup_of  INTEGER REFERENCES style_images(id) ON DELETE SET NULL,
+        added_at     REAL    NOT NULL,
+        UNIQUE (character_id, kind, sha256)
+    );
+    CREATE INDEX style_images_sha ON style_images(sha256);
+    CREATE TABLE style_analyses (
+        id             INTEGER PRIMARY KEY,
+        image_id       INTEGER NOT NULL REFERENCES style_images(id) ON DELETE CASCADE,
+        schema_version INTEGER NOT NULL,
+        model_label    TEXT    NOT NULL,
+        status         TEXT    NOT NULL CHECK (status IN ('ok', 'failed')),
+        record_json    TEXT,
+        raw_text       TEXT,
+        error          TEXT,
+        seconds        REAL,
+        reused_from    INTEGER,
+        created_at     REAL    NOT NULL,
+        UNIQUE (image_id, schema_version, model_label)
+    );
+    CREATE TABLE style_removed (
+        character_id INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+        kind         TEXT    NOT NULL,
+        sha256       TEXT    NOT NULL,
+        path         TEXT    NOT NULL,
+        removed_at   REAL    NOT NULL,
+        PRIMARY KEY (character_id, kind, sha256)
+    );
+    CREATE TABLE style_guides (
+        id             INTEGER PRIMARY KEY,
+        character_id   INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+        kind           TEXT    NOT NULL,
+        created_at     REAL    NOT NULL,
+        model_label    TEXT    NOT NULL,
+        schema_version INTEGER NOT NULL,
+        character_type TEXT,
+        image_count    INTEGER NOT NULL,
+        truncated      INTEGER NOT NULL DEFAULT 0,
+        seconds        REAL,
+        doc_path       TEXT,
+        archived_path  TEXT,
+        markdown       TEXT    NOT NULL,
+        stats_json     TEXT    NOT NULL
+    );
+    CREATE INDEX style_guides_lib ON style_guides(character_id, kind, created_at);
     """,
 ]
 
@@ -111,10 +171,10 @@ class CharacterStore:
         with self._lock, closing(self._connect()) as db:
             try:
                 cur = db.execute(
-                    "INSERT INTO characters (name, description, lora_path, lora_strength, trigger, prepend_trigger, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO characters (name, description, lora_path, lora_strength, trigger, prepend_trigger, character_type, "
+                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (v["name"], v.get("description", ""), v.get("lora_path", ""), v.get("lora_strength", 1.0),
-                     v.get("trigger", ""), int(v.get("prepend_trigger", True)), now, now),
+                     v.get("trigger", ""), int(v.get("prepend_trigger", True)), v.get("character_type", ""), now, now),
                 )
                 db.commit()
             except sqlite3.IntegrityError as e:
@@ -148,6 +208,7 @@ class CharacterStore:
         return self.get(cid)
 
     def delete(self, cid: int) -> None:
+        """Deletes the record and (by cascade) its style libraries and guide history; never any file."""
         with self._lock, closing(self._connect()) as db:
             cur = db.execute("DELETE FROM characters WHERE id = ?", (cid,))
             db.commit()
@@ -197,6 +258,13 @@ def validate(data: dict, partial: bool) -> dict:
         if not isinstance(data["prepend_trigger"], bool):
             raise CharacterError("prepend_trigger must be true/false")
         out["prepend_trigger"] = data["prepend_trigger"]
+    if "character_type" in data:  # an id from config/character_types.json ("" = not set); existence is checked by the API
+        t = data["character_type"]
+        if t is None:
+            t = ""
+        if not isinstance(t, str) or not TYPE_ID_RE.match(t.strip()):
+            raise CharacterError("character_type must be a type id (lowercase letters, digits, underscores)")
+        out["character_type"] = t.strip()
     return out
 
 

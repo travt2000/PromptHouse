@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import os
 import string
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 
 from . import checkpoints as ck
@@ -25,6 +28,15 @@ from .lora import STRENGTH_LIMIT, LoraLibrary
 from .model_manager import Component, ModelError, ModelManager
 from .monitoring import Monitor
 from .outputs import image_path
+from .style import vsettings as vs
+from .style.character_types import CharacterTypesError, load_character_types
+from .style.kinds import KINDS as STYLE_KINDS, get_kind
+from .prompt_files import PromptFileError
+from .style import prompts as sprompts
+from .style.llama_server import ServerManager
+from .style.runner import StyleRunner
+from .style.scanner import scan_folder
+from .style.store import StyleStore
 
 log = logging.getLogger("krea.app")
 STATIC = Path(__file__).resolve().parent.parent / "static"
@@ -42,6 +54,10 @@ class State:
     workspace: dict | None = None
     docs_root: Path
     doc_index: cdocs.DocIndex
+    style_store: StyleStore | None = None
+    style_server: ServerManager | None = None
+    style: StyleRunner | None = None
+    style_thumbs: Path
     startup_error: str | None = None
 
 
@@ -66,6 +82,8 @@ async def lifespan(app: FastAPI):
     S.workspace = None
     S.docs_root = Path(cfg.CHARACTER_DOCS_DIR)
     S.doc_index = cdocs.DocIndex()
+    S.style_thumbs = Path(cfg.STYLE_THUMBS_DIR)
+    S.style_server = ServerManager(Path(cfg.LLAMA_LOG_FILE))
     try:
         S.characters = CharacterStore(cfg.DB_FILE)
         for c in S.characters.list():  # characters created before document folders existed
@@ -74,8 +92,11 @@ async def lifespan(app: FastAPI):
                     _provision_folder(c)
                 except OSError as e:
                     log.warning("could not create the document folder for %s: %s", c["name"], e)
+        S.style_store = StyleStore(cfg.DB_FILE)  # tables created by the character store's migrations
+        S.style = StyleRunner(S.style_store, S.style_server, _launch_style, _prepare_for_vision)
     except Exception as e:  # noqa: BLE001 - a broken DB must not take down generation
         S.characters = None
+        S.style_store = S.style = None
         S.startup_error = f"Character database unavailable ({e})"
         log.error("character DB: %s", e)
     try:
@@ -91,6 +112,12 @@ async def lifespan(app: FastAPI):
         S.startup_error = str(e)
         log.error("GPU initialisation failed: %s", e)
     yield
+    if S.style is not None:  # never leave a vision model server running after the app exits
+        S.style.cancel()
+    if S.style_server is not None:
+        S.style_server.stop()
+    if S.style is not None:
+        S.style.join(15)
 
 
 app = FastAPI(title="Krea 2 Turbo", lifespan=lifespan)
@@ -119,6 +146,7 @@ def status():
         "settings": {"seed": S.settings.seed, "randomize_seed": S.settings.randomize_seed},
         "lora_cache": S.loras.snapshot(),
         "workspace": _workspace_view(),
+        "style": S.style.status() if S.style else None,
     }
 
 
@@ -144,7 +172,8 @@ def resolutions():
 
 @app.get("/api/settings")
 def get_settings():
-    return {"settings": S.settings.__dict__, "validation": validate_models(S.settings), "max_seed": MAX_SEED}
+    return {"settings": S.settings.__dict__, "validation": validate_models(S.settings), "max_seed": MAX_SEED,
+            "vision_problems": vs.check_ready(S.settings.vision_settings())}
 
 
 @app.put("/api/settings")
@@ -166,7 +195,8 @@ def put_settings(patch: dict):
             S.cache.invalidate()  # conditioning came from a different text encoder
     save_settings(new)
     S.settings = new
-    return {"settings": new.__dict__, "validation": validate_models(new), "invalidated": [c.value for c in changed], "max_seed": MAX_SEED}
+    return {"settings": new.__dict__, "validation": validate_models(new), "invalidated": [c.value for c in changed], "max_seed": MAX_SEED,
+            "vision_problems": vs.check_ready(new.vision_settings())}
 
 
 # ------------------------------------------------------------------------------------------ LoRA stack
@@ -241,9 +271,16 @@ def validate_path(body: PathCheck):
         return {"compatible": False, "problems": [str(e)]}
 
 
+BROWSE_EXTS = {".safetensors", ".gguf", ".exe"}
+
+
 @app.get("/api/browse")
-def browse(path: str = Query("")):
-    """Minimal server-side file browser for picking local model paths (directories + .safetensors only)."""
+def browse(path: str = Query(""), ext: str = Query(".safetensors")):
+    """Minimal server-side file browser for picking local model paths: directories plus files with the
+    requested extensions (comma-separated; .safetensors, .gguf or .exe)."""
+    exts = {e.strip().lower() for e in ext.split(",") if e.strip()}
+    if not exts or not exts <= BROWSE_EXTS:
+        raise HTTPException(400, f"ext must be among {sorted(BROWSE_EXTS)}")
     if not path:
         if os.name == "nt":
             drives = [f"{d}:\\" for d in string.ascii_uppercase if os.path.exists(f"{d}:\\")]
@@ -258,7 +295,7 @@ def browse(path: str = Query("")):
             try:
                 if c.is_dir():
                     entries.append({"name": c.name, "path": str(c), "type": "dir"})
-                elif c.suffix.lower() == ".safetensors":
+                elif c.suffix.lower() in exts:
                     entries.append({"name": c.name, "path": str(c), "type": "file", "size": c.stat().st_size})
             except OSError:
                 continue
@@ -326,7 +363,33 @@ def _character_view(c: dict) -> dict:
     out = dict(c)
     out["docs_dir"] = str(S.docs_root / c["folder"]) if c["folder"] else None
     out["lora_info"] = S.loras.inspect(c["lora_path"]).to_dict() if c["lora_path"] else None
+    out["character_type_info"] = _character_type(c["character_type"])
     return out
+
+
+def _character_type(type_id: str):
+    """The configured type for an id: its dict, None if unset, or {"id", "missing": True} if the id is no
+    longer in config/character_types.json (or the file is broken)."""
+    if not type_id:
+        return None
+    try:
+        t = next((t for t in load_character_types() if t.id == type_id), None)
+    except CharacterTypesError:
+        t = None
+    return t.to_dict() if t else {"id": type_id, "label": type_id, "missing": True}
+
+
+def _check_character_type(body: dict, current: str = "") -> None:
+    """A new type must exist in the types file; keeping the current one is always allowed."""
+    t = body.get("character_type") if isinstance(body, dict) else None
+    if not isinstance(t, str) or not t.strip() or t.strip() == current:
+        return
+    try:
+        known = {x.id for x in load_character_types()}
+    except CharacterTypesError as e:
+        raise HTTPException(400, str(e)) from e
+    if t.strip() not in known:
+        raise HTTPException(400, f"Unknown character type: {t}")
 
 
 def _check_character_lora(path) -> None:
@@ -356,6 +419,7 @@ def list_characters():
 def create_character(body: dict):
     store = _store()
     _check_character_lora(body.get("lora_path"))
+    _check_character_type(body)
     c = _character_call(lambda: store.create(body))
     try:
         c = _provision_folder(c)
@@ -375,6 +439,7 @@ def get_character(cid: int):
 def update_character(cid: int, body: dict):
     store = _store()
     _check_character_lora(body.get("lora_path"))
+    _check_character_type(body, _character_call(lambda: store.get(cid))["character_type"])
     c = _character_call(lambda: store.update(cid, body))
     if S.workspace and S.workspace.get("character_id") == cid:
         _evict_unused()  # the active character's LoRA may have changed
@@ -385,7 +450,9 @@ def update_character(cid: int, body: dict):
 def delete_character(cid: int):
     store = _store()
     c = _character_call(lambda: store.get(cid))
-    _character_call(lambda: store.delete(cid))  # never touches the LoRA file or the document folder
+    if S.style and S.style.active and S.style.status()["character_id"] == cid:
+        raise HTTPException(409, "A style job is running for this character; cancel it or wait for it to finish.")
+    _character_call(lambda: store.delete(cid))  # never touches the LoRA file, the document folder or any image file
     S.doc_index.forget(cid)
     if S.workspace and S.workspace.get("character_id") == cid:
         S.workspace = None
@@ -474,6 +541,312 @@ def character_context(cid: int, q: str = Query("", max_length=2000), k: int = Qu
     hits = cdocs.DocIndex.search(chunks, q, k) if q.strip() else []
     return {"character_id": cid, "retriever": "bm25", "chunks_total": len(chunks), "warnings": warnings,
             "results": [{**ch.to_dict(), "score": score} for ch, score in hits]}
+
+
+# ------------------------------------------------------------------------------------------ style analysis
+# Per-character image libraries read by a local vision model (llama-server), and guides written from them.
+# Jobs run on the GPU worker (see app/style/runner.py), so they never overlap encode/generate.
+
+StyleKind = Literal["character", "inspiration"]
+
+
+def _launch_style(request: dict, work) -> None:
+    runner = _runner()
+    runner.submit_task("vision", request, lambda job: work(job.set_stage))
+
+
+def _prepare_for_vision(v: vs.VisionSettings) -> None:
+    """On the GPU worker, before the vision model starts: hand back cached VRAM and (by default) free the
+    Krea weights and LoRA adapters from system RAM. They are re-read from disk by the next generation."""
+    if S.manager is not None:
+        S.manager.make_room_for_external(v.release_krea_ram)
+    if v.release_krea_ram:
+        S.loras.evict_except([])
+
+
+def _style() -> StyleRunner:
+    if S.style is None or S.style_store is None:
+        raise HTTPException(503, S.startup_error or "Character database unavailable")
+    return S.style
+
+
+def _style_kind(key: str):
+    try:
+        return get_kind(key)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+def _style_counts(cid: int, kind_key: str, v: vs.VisionSettings | None = None) -> dict:
+    kind = get_kind(kind_key)
+    return S.style_store.counts(cid, kind.key, kind.schema_version, (v or S.settings.vision_settings()).model_label())
+
+
+def _style_image(image_id: int) -> dict:
+    _style()
+    image = S.style_store.get_image(image_id)
+    if image is None:
+        raise HTTPException(404, "No such image.")
+    return image
+
+
+def _gpu_free_for_style(style: StyleRunner) -> None:
+    if style.active:
+        raise HTTPException(409, "A style job is already running; only one runs at a time.")
+    if S.runner is not None and S.runner.busy:
+        raise HTTPException(409, f"A {S.runner.active.kind} job is using the GPU; try again when it finishes.")
+
+
+@app.get("/api/style/character-types")
+def style_character_types():
+    """The configured character types. The file is re-read each time; a broken file is reported, not raised."""
+    try:
+        return {"types": [t.to_dict() for t in load_character_types()], "error": None}
+    except CharacterTypesError as e:
+        return {"types": [], "error": str(e)}
+
+
+@app.get("/api/style/status")
+def style_status():
+    return _style().status()
+
+
+@app.post("/api/style/cancel")
+def style_cancel():
+    _style().cancel()
+    return {"ok": True}
+
+
+@app.get("/api/style/server-log")
+def style_server_log():
+    return {"log": S.style_server.log_tail(80) if S.style_server else ""}
+
+
+@app.get("/api/characters/{cid}/style")
+def character_style(cid: int):
+    style = _style()
+    store = _store()
+    c = _character_call(lambda: store.get(cid))
+    v = S.settings.vision_settings()
+    latest = {}
+    for k in STYLE_KINDS:
+        items = S.style_store.list_guides(cid, k)
+        latest[k] = items[0] if items else None
+    return {"character": _character_view(c), "model_label": v.model_label(), "problems": vs.check_ready(v),
+            "recursive": v.recursive, "counts": {k: _style_counts(cid, k, v) for k in STYLE_KINDS},
+            "latest_guides": latest, "status": style.status()}
+
+
+@app.get("/api/characters/{cid}/style/images")
+def character_style_images(cid: int, kind: StyleKind, status: str | None = Query(None, pattern="^(ok|failed|pending)$"),
+                           limit: int = Query(60, ge=1, le=500), offset: int = Query(0, ge=0)):
+    _style()
+    store = _store()
+    _character_call(lambda: store.get(cid))
+    k = get_kind(kind)
+    label = S.settings.vision_settings().model_label()
+    items, total = S.style_store.list_images(cid, k.key, status, k.schema_version, label, limit, offset)
+    return {"items": items, "total": total, "counts": _style_counts(cid, k.key)}
+
+
+class StyleScan(BaseModel):
+    kind: StyleKind
+    folder: str = Field(..., max_length=4096)
+    recursive: bool | None = None
+    include_removed: bool = False
+
+
+@app.post("/api/characters/{cid}/style/scan")
+def character_style_scan(cid: int, req: StyleScan):
+    """Register a folder's images in one of the character's libraries (files are only read)."""
+    _style()
+    store = _store()
+    _character_call(lambda: store.get(cid))
+    recursive = S.settings.vision_settings().recursive if req.recursive is None else req.recursive
+    try:
+        r = scan_folder(S.style_store, cid, req.kind, req.folder, recursive, req.include_removed)
+    except FileNotFoundError as e:
+        raise HTTPException(400, str(e)) from e
+    return {**r.__dict__, "counts": _style_counts(cid, req.kind)}
+
+
+class StyleRemove(BaseModel):
+    image_ids: list[int] = Field(..., max_length=100_000)
+
+
+@app.post("/api/characters/{cid}/style/remove")
+def character_style_remove(cid: int, req: StyleRemove):
+    """Remove images (and their analyses) from the character's libraries. Files on disk are never touched."""
+    style = _style()
+    if style.active and style.status()["character_id"] == cid:
+        raise HTTPException(409, "Wait for the running style job to finish before removing images.")
+    removed, orphaned = S.style_store.remove_images(cid, req.image_ids)
+    for sha in orphaned:
+        (S.style_thumbs / f"{sha}.jpg").unlink(missing_ok=True)
+    return {"removed": removed}
+
+
+class StyleAnalyze(BaseModel):
+    kind: StyleKind
+    reanalyze: bool = False
+    image_ids: list[int] | None = None
+
+
+@app.post("/api/characters/{cid}/style/analyze")
+def character_style_analyze(cid: int, req: StyleAnalyze):
+    """Analyze a library's pending images (or the given ones, or all with `reanalyze`) with the vision model.
+    A pending image whose file was already analyzed in another character's library of the same kind (same
+    model and schema) reuses that analysis instead of being sent to the model again."""
+    style = _style()
+    store = _store()
+    _character_call(lambda: store.get(cid))
+    v = S.settings.vision_settings()
+    problems = vs.check_ready(v)
+    if problems:
+        raise HTTPException(400, " ".join(problems))
+    kind = _style_kind(req.kind)
+    label = v.model_label()
+    if req.image_ids is not None:
+        lib = S.style_store.library_ids(cid, kind.key)
+        ids = [i for i in dict.fromkeys(req.image_ids) if i in lib]
+    else:
+        ids = S.style_store.pending_ids(cid, kind.key, kind.schema_version, label, req.reanalyze)
+    if not ids:
+        raise HTTPException(400, "Nothing to analyze.")
+    _gpu_free_for_style(style)
+    reused = [] if (req.reanalyze or req.image_ids is not None) else S.style_store.reuse_analyses(ids, kind.schema_version, label)
+    rest = [i for i in ids if i not in set(reused)]
+    if rest:
+        try:
+            style.start(v, cid, kind, rest, len(reused))
+        except RuntimeError as e:  # includes Busy
+            raise HTTPException(409, str(e)) from e
+    return {"queued": len(rest), "reused": len(reused)}
+
+
+class StyleGuideRequest(BaseModel):
+    kind: StyleKind
+
+
+@app.post("/api/characters/{cid}/style/guides")
+def character_style_write_guide(cid: int, req: StyleGuideRequest):
+    """Write a Self-Style Guide (character library) or Content Guide (inspiration) into the character's documents."""
+    style = _style()
+    v = S.settings.vision_settings()
+    problems = vs.check_ready(v)
+    if problems:
+        raise HTTPException(400, " ".join(problems))
+    kind = _style_kind(req.kind)
+    c, folder = _docs_folder(cid)
+    n = _style_counts(cid, kind.key, v)["ok"]
+    if not n:
+        raise HTTPException(400, "Analyze some images in this library first; the guide is written from their analyses.")
+    ctype = _ctype_for(c)
+    _gpu_free_for_style(style)
+    try:
+        style.start_guide(v, cid, kind, ctype, c["name"], folder)
+    except RuntimeError as e:
+        raise HTTPException(409, str(e)) from e
+    return {"images": n}
+
+
+def _ctype_for(c: dict):
+    if not c["character_type"]:
+        return None
+    try:
+        return next((t for t in load_character_types() if t.id == c["character_type"]), None)
+    except CharacterTypesError as e:
+        raise HTTPException(400, f"Fix the character types file first: {e}") from e
+
+
+class PromptIdeasRequest(BaseModel):
+    idea: str = Field("", max_length=1000)  # optional direction, e.g. "rainy city night"
+    count: int = Field(4, ge=1, le=sprompts.MAX_COUNT)
+
+
+@app.post("/api/characters/{cid}/prompts")
+def character_write_prompts(cid: int, req: PromptIdeasRequest):
+    """Write image prompts with the local model from the character's guides (guides/ in its documents).
+    Runs on the GPU worker like a style job; the result appears in /api/style/status as ``prompts``."""
+    style = _style()
+    v = S.settings.vision_settings()
+    problems = vs.check_ready(v, vision=False)
+    if problems:
+        raise HTTPException(400, " ".join(problems))
+    c, folder = _docs_folder(cid)
+    try:
+        guides = sprompts.load_guides(folder)
+    except OSError as e:
+        raise HTTPException(500, f"Could not read the guides: {e}") from e
+    if not guides:
+        raise HTTPException(400, "This character has no guides yet. Write a Self-Style Guide or Content Guide in the "
+                                 "Style window first (they are saved to guides/ in the character's documents).")
+    try:
+        messages = sprompts.build_messages(guides, _ctype_for(c), req.idea, req.count, sprompts.budget_chars(v))
+    except PromptFileError as e:
+        raise HTTPException(500, f"Prompt file problem: {e}") from e
+    _gpu_free_for_style(style)
+    try:
+        style.start_prompts(v, cid, messages, req.count, [g.path for g in guides], req.idea.strip())
+    except RuntimeError as e:
+        raise HTTPException(409, str(e)) from e
+    return {"guides": [g.path for g in guides], "count": req.count}
+
+
+@app.get("/api/characters/{cid}/style/guides")
+def character_style_guides(cid: int, kind: StyleKind):
+    _style()
+    return {"items": S.style_store.list_guides(cid, kind)}
+
+
+@app.get("/api/style/guides/{guide_id}")
+def style_guide(guide_id: int):
+    _style()
+    g = S.style_store.get_guide(guide_id)
+    if g is None:
+        raise HTTPException(404, "No such guide.")
+    return g
+
+
+@app.get("/api/style/images/{image_id}")
+def style_image_detail(image_id: int):
+    image = _style_image(image_id)
+    kind = get_kind(image["kind"])
+    return {"image": image, "analyses": S.style_store.get_analyses(image_id),
+            "current_model": S.settings.vision_settings().model_label(), "current_schema_version": kind.schema_version}
+
+
+@app.get("/api/style/images/{image_id}/file")
+def style_image_file(image_id: int):
+    image = _style_image(image_id)  # only registered images are ever served
+    if not Path(image["path"]).is_file():
+        raise HTTPException(404, "The image file is no longer on disk.")
+    return FileResponse(image["path"])
+
+
+STYLE_THUMB_EDGE = 360
+
+
+@app.get("/api/style/images/{image_id}/thumb")
+def style_image_thumb(image_id: int):
+    image = _style_image(image_id)
+    cached = S.style_thumbs / f"{image['sha256']}.jpg"
+    if not cached.is_file():
+        if not Path(image["path"]).is_file():
+            raise HTTPException(404, "The image file is no longer on disk.")
+        try:
+            with Image.open(image["path"]) as img:
+                img = ImageOps.exif_transpose(img).convert("RGB")
+                img.thumbnail((STYLE_THUMB_EDGE, STYLE_THUMB_EDGE), Image.LANCZOS)
+                buf = io.BytesIO()
+                img.save(buf, "JPEG", quality=80)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(415, f"Could not read the image: {e}") from e
+        S.style_thumbs.mkdir(parents=True, exist_ok=True)
+        tmp = cached.with_name(f".{cached.name}.tmp")
+        tmp.write_bytes(buf.getvalue())
+        os.replace(tmp, cached)
+    return Response(cached.read_bytes(), media_type="image/jpeg", headers={"Cache-Control": "max-age=86400"})
 
 
 class WorkspaceRequest(BaseModel):

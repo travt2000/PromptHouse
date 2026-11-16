@@ -565,6 +565,18 @@ class ModelManager:
                 self.cuda_unrecoverable = True
             log.error("CUDA cleanup failed: %s", msg)
 
+    def make_room_for_external(self, release_ram: bool) -> None:
+        """Before another process (the style-analysis vision model) uses the GPU: return PyTorch's cached
+        VRAM to the driver and, if `release_ram`, free every component's weights from system RAM too (they
+        are re-read from disk on next use). Call on the GPU worker thread, with no component on the GPU."""
+        with self._lock:
+            if self._gpu_owner is not None:
+                raise ModelError(f"{self._gpu_owner.value} is on the GPU")
+            if release_ram:
+                for c in Component:
+                    self.release_cpu(c)
+        self._cleanup_cuda()
+
     def post_failure_cleanup(self) -> str | None:
         """Call after a failed stage once the exception (and its traceback frames) has been dropped."""
         self._cleanup_cuda()

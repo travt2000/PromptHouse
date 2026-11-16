@@ -15,4 +15,6 @@ uvicorn[standard]==0.54.0
 pydantic==2.14.3
 psutil==7.2.2
 pyyaml==6.0.3            # Markdown front matter in character documents
+httpx==0.28.1             # talks to the vision model server (llama-server) for style analysis
+jsonschema==4.26.0        # validates the vision model's structured records
 nvidia-ml-py==13.615.71   # NVML bindings (import name: pynvml)

@@ -31,7 +31,7 @@ class Busy(RuntimeError):
 
 @dataclass
 class Job:
-    kind: str  # "encode" | "generate"
+    kind: str  # "encode" | "generate" | "vision" (style analysis / guide writing)
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     status: str = "queued"  # queued | running | complete | error
     stage: str = "Queued"
@@ -105,6 +105,14 @@ class JobRunner:
         self._claim(job)
         keep = [e["path"] for e in stack]
         self._executor.submit(self._run, job, lambda: self._generate(job, cond, res, seed, active, keep, extra_meta))
+        return job
+
+    def submit_task(self, kind: str, request: dict, fn: Callable[[Job], None]) -> Job:
+        """Run `fn(job)` on the GPU worker as a job of its own (e.g. a style-analysis batch that starts a
+        vision model). While it runs, encode/generate are refused, so it has the GPU to itself."""
+        job = Job(kind=kind, request=dict(request))
+        self._claim(job)
+        self._executor.submit(self._run, job, lambda: fn(job))
         return job
 
     def run_on_worker(self, fn: Callable[[], object]) -> object:

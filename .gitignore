@@ -6,3 +6,5 @@ outputs/
 models/
 settings.json
 data/
+llama-server/
+vision_model/

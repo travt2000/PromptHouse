@@ -120,6 +120,7 @@ async function pollStatus() {
       renderJobFromStatus();
       renderResidency();
       updateControls();
+      renderGuidePrompts();
     } catch (e) { /* server restarting */ }
     await sleep(1000);
   }
@@ -167,8 +168,9 @@ function renderJobFromStatus() {
   const job = state.status?.active_job;
   if (job && job.kind === "generate" && !state.pollingJob) followGenerate(job.id); // page reloaded mid-job
   if (job && job.kind === "encode") { $("gen-status").textContent = "Encoding prompt"; $("gen-stage").textContent = job.stage; }
+  else if (job && job.kind === "vision") { $("gen-status").textContent = "Local model (GPU busy)"; $("gen-stage").textContent = job.stage; }
   else if (!job && !state.pollingJob) {
-    if ($("gen-status").textContent === "Encoding prompt") $("gen-status").textContent = "Idle";
+    if (["Encoding prompt", "Local model (GPU busy)"].includes($("gen-status").textContent)) { $("gen-status").textContent = "Idle"; $("gen-stage").textContent = "-"; }
   }
 }
 
@@ -309,7 +311,7 @@ function infoHtml(v, comp) {
 }
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-async function openSettings() {
+async function openSettings(section) {
   const data = await api("/api/settings");
   state.settings = data.settings;
   const comps = state.status?.models?.components || {};
@@ -328,8 +330,10 @@ async function openSettings() {
   $("seed").max = data.max_seed;
   $("randomize").checked = data.settings.randomize_seed;
   document.querySelectorAll("[data-keep]").forEach((el) => { el.checked = !!data.settings.keep_in_ram[el.dataset.keep]; });
+  renderVisionSettings(data.vision_problems);
   $("settings-msg").textContent = "";
   $("settings").hidden = false;
+  if (section === "vision") $("vision-heading").scrollIntoView({ block: "start" });
 }
 
 async function validateField(key) {
@@ -340,21 +344,24 @@ async function validateField(key) {
 
 async function saveSettings() {
   const patch = {};
-  document.querySelectorAll("[data-path]").forEach((el) => { patch[el.dataset.path] = el.value; });
+  document.querySelectorAll("#model-fields [data-path]").forEach((el) => { patch[el.dataset.path] = el.value; });
   const seed = $("seed").value.trim();
   if (!/^\d+$/.test(seed)) { $("settings-msg").textContent = "Seed must be a non-negative integer."; $("settings-msg").className = "hint err"; return; }
   patch.seed = Number(seed);
   patch.randomize_seed = $("randomize").checked;
   patch.keep_in_ram = {};
   document.querySelectorAll("[data-keep]").forEach((el) => { patch.keep_in_ram[el.dataset.keep] = el.checked; });
+  patch.vision = collectVision();
   try {
     const r = await api("/api/settings", { method: "PUT", body: JSON.stringify(patch) });
     state.settings = r.settings;
     for (const [key] of MODEL_FIELDS) $(`info-${key}`).innerHTML = infoHtml(r.validation[key]);
     const inv = r.invalidated.length ? ` Reloaded on next use: ${r.invalidated.join(", ")}.` : "";
     const enc = r.invalidated.includes("text_encoder") ? " Prompt conditioning invalidated — encode again." : "";
+    renderVisionProblems(r.vision_problems);
     $("settings-msg").textContent = `Saved.${inv}${enc}`;
     $("settings-msg").className = "hint ok";
+    if (!$("style").hidden) refreshStyleSummary();
     state.status = await api("/api/status");
     updateControls();
   } catch (e) {
@@ -366,16 +373,18 @@ async function saveSettings() {
 // server-side file browser
 let browseTarget = null;
 // onPick: optional callback for the chosen path (navigation keeps the current target's callback)
-async function browse(key, type, path, onPick) {
-  if (!browseTarget || browseTarget.key !== key || onPick !== undefined || path === undefined) browseTarget = { key, type, onPick: onPick || null };
+// exts: file extensions to list (default .safetensors), e.g. ".gguf" or ".exe"
+async function browse(key, type, path, onPick, exts) {
+  if (!browseTarget || browseTarget.key !== key || onPick !== undefined || path === undefined) browseTarget = { key, type, onPick: onPick || null, exts: exts || ".safetensors" };
   let start = path;
   if (start === undefined) {
     const cur = document.querySelector(`[data-path="${key}"]`).value;
     start = cur ? (type === "dir" ? cur : cur.replace(/[\\/][^\\/]*$/, "")) : "";
   }
   let data;
-  try { data = await api(`/api/browse?path=${encodeURIComponent(start)}`); }
-  catch (_) { data = await api("/api/browse?path="); }
+  const ext = encodeURIComponent(browseTarget.exts);
+  try { data = await api(`/api/browse?path=${encodeURIComponent(start)}&ext=${ext}`); }
+  catch (_) { data = await api(`/api/browse?path=&ext=${ext}`); }
   $("browser-path").textContent = data.path || "Drives";
   const items = [];
   if (data.parent !== null && data.path) items.push(`<li class="dir" data-dir="${esc(data.parent)}">..</li>`);
@@ -383,7 +392,7 @@ async function browse(key, type, path, onPick) {
     if (e.type === "dir") items.push(`<li class="dir" data-dir="${esc(e.path)}">${esc(e.name)}</li>`);
     else if (type === "file") items.push(`<li data-file="${esc(e.path)}"><span>${esc(e.name)}</span><span class="hint">${fmtGiB(e.size)} GiB</span></li>`);
   }
-  $("browser-list").innerHTML = items.join("") || `<li class="hint">No .safetensors files here</li>`;
+  $("browser-list").innerHTML = items.join("") || `<li class="hint">${type === "dir" ? "No subfolders here" : `No ${esc(browseTarget.exts.replaceAll(",", " / "))} files here`}</li>`;
   $("browser-pick-dir").hidden = type !== "dir" || !data.path;
   $("browser-pick-dir").dataset.path = data.path;
   $("browser").hidden = false;
@@ -647,6 +656,7 @@ function renderCharBar() {
   $("char-name").textContent = c ? c.name : "No character";
   $("edit-active-char").hidden = !c;
   $("docs-active-char").hidden = !c;
+  $("style-active-char").hidden = !c;
   const bits = [];
   if (c && c.lora_path) bits.push(`LoRA ${stem(c.lora_path)} @ ${c.lora_strength}`);
   if (c && !c.lora_path) bits.push("No LoRA set");
@@ -655,6 +665,7 @@ function renderCharBar() {
   $("prepend-wrap").hidden = !(c && c.trigger);
   $("trigger-chip").textContent = c?.trigger || "";
   document.title = c ? `${c.name} · PromptHouse` : "PromptHouse";
+  renderGuidePrompts();
 }
 
 function setLandingMsg(text, cls = "") { $("landing-msg").textContent = text; $("landing-msg").className = `hint ${cls}`; }
@@ -679,7 +690,7 @@ const selectedCharacter = () => state.characters.find((c) => String(c.id) === $(
 function renderCharSummary() {
   const c = selectedCharacter();
   const none = !c;
-  for (const id of ["char-load", "char-edit", "char-docs", "char-delete"]) $(id).disabled = none;
+  for (const id of ["char-load", "char-edit", "char-docs", "char-style", "char-delete"]) $(id).disabled = none;
   if (!c) { $("char-summary").innerHTML = ""; return; }
   const rows = [];
   if (c.lora_path) {
@@ -688,6 +699,8 @@ function renderCharSummary() {
     if (bad) rows.push(`<div class="hint err">${esc(c.lora_info.problems.join(" "))}</div>`);
   } else rows.push(`<div class="hint">No LoRA set</div>`);
   if (c.trigger) rows.push(`<div><span class="k">Trigger</span> <span class="mono">${esc(c.trigger)}</span>${c.prepend_trigger ? "" : ' <span class="hint">(not prepended by default)</span>'}</div>`);
+  const t = c.character_type_info;
+  if (t) rows.push(`<div><span class="k">Type</span> ${esc(t.label)}${t.missing ? ' <span class="hint warn">(not in config/character_types.json)</span>' : ""}</div>`);
   if (c.description) rows.push(`<div class="desc">${esc(c.description)}</div>`);
   $("char-summary").innerHTML = rows.join("");
   $("char-load").disabled = !!(c.lora_path && c.lora_info && !c.lora_info.compatible);
@@ -712,7 +725,7 @@ async function leaveWorkspace() {
 async function deleteCharacter() {
   const c = selectedCharacter();
   if (!c) return;
-  if (!confirm(`Delete the character "${c.name}"?\n\nThis removes the character record only. The LoRA file and the character's document folder are kept on disk.`)) return;
+  if (!confirm(`Delete the character "${c.name}"?\n\nThis removes the character record and its style libraries (image analyses and guide history). The LoRA file, the character's document folder (including written guides) and all image files are kept on disk.`)) return;
   try {
     const r = await api(`/api/characters/${c.id}`, { method: "DELETE" });
     setLandingMsg(`Deleted ${c.name}.${r.docs_kept ? ` Documents kept in ${r.docs_kept}` : ""}`, "ok");
@@ -723,8 +736,11 @@ async function deleteCharacter() {
 // editor
 function setEditorMsg(text, cls = "") { $("ce-msg").textContent = text; $("ce-msg").className = `hint ${cls}`; }
 
-function openEditor(c) {
+async function openEditor(c) {
   state.editingId = c ? c.id : null;
+  await loadTypes();
+  fillTypeSelect($("ce-type"), c?.character_type || "");
+  $("ce-type-desc").textContent = typeDescription(c?.character_type || "");
   $("ce-title").textContent = c ? `Edit ${c.name}` : "New character";
   $("ce-name").value = c?.name || "";
   $("ce-lora").value = c?.lora_path || "";
@@ -763,6 +779,7 @@ async function saveEditor() {
     trigger: $("ce-trigger").value,
     prepend_trigger: $("ce-prepend").checked,
     description: $("ce-description").value,
+    character_type: $("ce-type").value,
   };
   if (!body.name.trim()) { setEditorMsg("Name is required.", "err"); $("ce-name").focus(); return; }
   try {
@@ -951,6 +968,674 @@ function wireDocs() {
   window.addEventListener("beforeunload", (ev) => { if (!$("docs").hidden && docsDirty()) { ev.preventDefault(); ev.returnValue = ""; } });
 }
 
+// ------------------------------------------------------------------------------------ vision model settings
+// The `vision` section of settings.json (app/style/vsettings.py), edited in the Settings dialog.
+const VISION_PATHS = [
+  ["llama_server_path", "llama-server executable", ".exe"],
+  ["model_path", "Vision model (.gguf)", ".gguf"],
+  ["mmproj_path", "Vision projector — mmproj (.gguf, must match the model)", ".gguf"],
+];
+const VISION_MAIN = [["n_ctx", "Context size", "int"], ["n_gpu_layers", "GPU layers", "int"], ["extra_args", "Extra llama-server arguments", "text", "e.g. --n-cpu-moe 20"]];
+const VISION_ADVANCED = [
+  ["external_url", "Endpoint URL (instead of llama-server)", "text", "http://127.0.0.1:1234"], ["external_model", "Endpoint model name", "text"],
+  ["startup_timeout_s", "Startup timeout (s)", "int"], ["request_timeout_s", "Request timeout (s)", "int"], ["port", "Port (0 = automatic)", "int"],
+  ["image_max_edge", "Image max edge (px)", "int"], ["jpeg_quality", "JPEG quality", "int"], ["temperature", "Temperature", "float"],
+  ["max_tokens", "Max output tokens", "int"], ["structured_mode", "Structured output", "select"],
+  ["chat_template_kwargs", "Chat template arguments (JSON)", "text"], ["guide_max_tokens", "Guide max tokens", "int"],
+  ["guide_temperature", "Guide temperature", "float"], ["prompt_max_tokens", "Prompt-writing max tokens", "int"],
+  ["prompt_temperature", "Prompt-writing temperature", "float"],
+];
+
+function visionInput([key, label, type, placeholder]) {
+  const v = state.settings?.vision?.[key] ?? "";
+  if (type === "select") {
+    const opts = ["json_schema", "json_object", "none"].map((o) => `<option value="${o}" ${o === v ? "selected" : ""}>${o === "none" ? "none (prompt only)" : o}</option>`).join("");
+    return `<label>${esc(label)}<select data-vision="${key}" data-vtype="text">${opts}</select></label>`;
+  }
+  const num = type === "int" || type === "float";
+  return `<label>${esc(label)}<input type="${num ? "number" : "text"}" ${type === "float" ? 'step="0.05"' : ""} data-vision="${key}" data-vtype="${type}" value="${esc(v)}" placeholder="${esc(placeholder || "")}"></label>`;
+}
+
+function renderVisionSettings(problems) {
+  $("vision-fields").innerHTML = VISION_PATHS.map(([key, label, ext]) => `
+    <div class="vision-field">
+      <label>${esc(label)}</label>
+      <div class="path-row"><input type="text" data-vision="${key}" data-vtype="text" value="${esc(state.settings?.vision?.[key] ?? "")}">
+        <button class="btn small" data-vbrowse="${key}" data-ext="${ext}">Browse…</button></div>
+    </div>`).join("") + `<div class="grid3">${VISION_MAIN.map(visionInput).join("")}</div>`;
+  $("vision-advanced").innerHTML = VISION_ADVANCED.map(visionInput).join("");
+  document.querySelector('[data-vision="release_krea_ram"]').checked = !!state.settings?.vision?.release_krea_ram;
+  renderVisionProblems(problems);
+}
+
+function renderVisionProblems(problems) {
+  $("vision-problems").textContent = problems && problems.length ? problems.join(" ") : "";
+}
+
+function collectVision() {
+  const out = {};
+  document.querySelectorAll("[data-vision]").forEach((el) => {
+    const key = el.dataset.vision;
+    if (el.type === "checkbox") out[key] = el.checked;
+    else if (el.dataset.vtype === "int" || el.dataset.vtype === "float") out[key] = el.value.trim() === "" ? el.value : Number(el.value);
+    else out[key] = el.value;
+  });
+  return out;
+}
+
+// ------------------------------------------------------------------------------------ character types
+// config/character_types.json, re-read by the server on every request.
+const ctypes = { list: [], error: null };
+
+async function loadTypes() {
+  try { const r = await api("/api/style/character-types"); ctypes.list = r.types; ctypes.error = r.error; }
+  catch (e) { ctypes.list = []; ctypes.error = e.message; }
+}
+
+function fillTypeSelect(sel, current) {
+  sel.innerHTML = `<option value="">— not set —</option>` + ctypes.list.map((t) => `<option value="${esc(t.id)}">${esc(t.label)}</option>`).join("");
+  if (current && !ctypes.list.some((t) => t.id === current)) {
+    // the stored id was removed or renamed in the JSON: keep showing it rather than silently clearing it
+    sel.insertAdjacentHTML("beforeend", `<option value="${esc(current)}">${esc(current)} (no longer in the config)</option>`);
+  }
+  sel.value = current || "";
+}
+const typeInfo = (id) => ctypes.list.find((t) => t.id === id) || null;
+function typeDescription(id) {
+  if (ctypes.error) return `Character types file: ${ctypes.error}`;
+  return typeInfo(id)?.description || "";
+}
+
+// ------------------------------------------------------------------------------------ style analysis
+// Per-character image libraries read by a local vision model, and the guides written from them
+// (app/style). Jobs run on the GPU worker, so generation waits while one runs.
+const STYLE_KINDS = {
+  character: {
+    intro: "Images of this character. Each one is assessed for hair, colouring, build and what flatters them; together they become the Self-Style Guide.",
+    placeholder: "Folder of images of the character, e.g. D:\\Characters\\Bailey\\refs",
+    guide: "Self-Style Guide",
+  },
+  inspiration: {
+    intro: "Images of content this character should make. Each one is read for format, outfit, pose, setting, light and mood — the person in it is never described. Together they become the Content Guide.",
+    placeholder: "Folder of inspiration images",
+    guide: "Content Guide",
+  },
+};
+const STYLE_PAGE = 60;
+const sty = { cid: null, name: "", kind: "character", filter: "", offset: 0, token: 0, selected: new Set(), lastPicked: null,
+              data: null, status: null, polling: false, analyzed: 0, guide: null, localError: false };
+
+// tiny DOM builder (text is never parsed as HTML)
+function h(tag, props = {}, ...kids) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "class") node.className = v;
+    else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+    else node.setAttribute(k, v);
+  }
+  for (const kid of kids.flat()) if (kid !== null && kid !== undefined && kid !== "") node.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+  return node;
+}
+const pretty = (v) => String(v).replaceAll("_", " ");
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+const styleUrl = (tail = "") => `/api/characters/${sty.cid}/style${tail}`;
+const folderKey = () => `styleFolder:${sty.cid}:${sty.kind}`;
+
+async function openStyle(c) {
+  sty.cid = c.id;
+  sty.name = c.name;
+  sty.kind = recall("styleKind") === "inspiration" ? "inspiration" : "character";
+  sty.guide = null;
+  $("style-title").textContent = `${c.name} — Style`;
+  $("style-log-text").hidden = true;
+  $("style").hidden = false;
+  await loadTypes();
+  await refreshStyleSummary(true);
+  showStyleKind(sty.kind);
+  pollStyle();
+}
+
+function closeStyle() {
+  $("style").hidden = true;
+  if (!$("landing").hidden) loadLanding(sty.cid);
+}
+
+async function refreshStyleSummary(first) {
+  try {
+    const d = await api(styleUrl());
+    sty.data = d;
+    if (first) $("style-recursive").checked = d.recursive;
+    const probs = d.problems || [];
+    $("style-problems").hidden = !probs.length;
+    $("style-problems").innerHTML = probs.length ? `${probs.map(esc).join("<br>")} <button class="btn small" id="style-fix">Open settings</button>` : "";
+    $("style-model").textContent = probs.length ? "" : `Model: ${d.model_label}`;
+    fillTypeSelect($("style-type"), d.character.character_type);
+    $("style-type-desc").textContent = typeDescription(d.character.character_type);
+    showStyleCounts(d.counts[sty.kind]);
+    renderStyleStatus(d.status);
+  } catch (e) { $("style-run-msg").textContent = e.message; }
+}
+
+function showStyleKind(kind) {
+  sty.kind = kind;
+  store("styleKind", kind);
+  const k = STYLE_KINDS[kind];
+  document.querySelectorAll("#style .tab").forEach((t) => t.classList.toggle("active", t.dataset.kind === kind));
+  $("style-intro").textContent = k.intro;
+  $("style-guide").textContent = `Write ${k.guide}`;
+  $("style-folder").placeholder = k.placeholder;
+  $("style-folder").value = recall(folderKey()) || "";
+  $("style-scan-result").textContent = "";
+  showStyleError("");
+  clearStyleSelection();
+  if (sty.data) showStyleCounts(sty.data.counts[kind]);
+  loadStyleGallery(true);
+  loadStyleGuides();
+  renderStyleStatus(sty.status);
+}
+
+function showStyleCounts(c) {
+  if (!c) return;
+  if (sty.data) sty.data.counts[sty.kind] = c;
+  sty.analyzed = c.ok;
+  $("style-counts").textContent = `${plural(c.images, "image")} · ${c.ok} analyzed · ${c.pending} pending` + (c.failed ? ` · ${c.failed} failed` : "");
+  updateGuideButton();
+}
+
+// ---- gallery
+function badgeHtml(item) {
+  const b = item.analysis_status === "ok" ? `<span class="s-badge ok">analyzed</span>` : item.analysis_status === "failed" ? `<span class="s-badge failed">failed</span>` : "";
+  const dup = item.near_dup_of ? `<span class="s-badge dup" title="Looks like image #${item.near_dup_of}">similar</span>` : "";
+  return b + dup;
+}
+
+async function loadStyleGallery(reset) {
+  if (reset) { sty.offset = 0; $("style-gallery").innerHTML = ""; }
+  const token = ++sty.token; // a newer load (tab switch, filter) wins
+  const q = new URLSearchParams({ kind: sty.kind, limit: STYLE_PAGE, offset: sty.offset });
+  if (sty.filter) q.set("status", sty.filter);
+  let data;
+  try { data = await api(`${styleUrl("/images")}?${q}`); } catch (e) { $("style-run-msg").textContent = e.message; return; }
+  if (token !== sty.token) return;
+  $("style-gallery").insertAdjacentHTML("beforeend", data.items.map((item) => `
+    <div class="s-card${sty.selected.has(item.id) ? " selected" : ""}" data-id="${item.id}">
+      <button class="open" title="${esc(item.path)}"><img src="/api/style/images/${item.id}/thumb" loading="lazy" alt=""></button>
+      <label class="pick" title="Select (shift-click to select a range)"><input type="checkbox" ${sty.selected.has(item.id) ? "checked" : ""} aria-label="Select image ${item.id}"></label>
+      <span class="badges">${badgeHtml(item)}</span>
+    </div>`).join(""));
+  sty.offset += data.items.length;
+  $("style-more").hidden = sty.offset >= data.total;
+  if (!data.total) $("style-gallery").innerHTML = `<div class="hint">${sty.filter ? "No images with this status." : "No images yet: scan a folder above."}</div>`;
+  showStyleCounts(data.counts);
+  showStyleSelection();
+}
+
+// refresh the badges of the cards already shown (during a batch), without losing the scroll position
+async function refreshStyleBadges() {
+  const shown = shownStyleIds();
+  if (!shown.length || sty.filter) { loadStyleGallery(true); return; }
+  const q = new URLSearchParams({ kind: sty.kind, limit: Math.min(500, Math.max(sty.offset, STYLE_PAGE)), offset: 0 });
+  try {
+    const data = await api(`${styleUrl("/images")}?${q}`);
+    const byId = new Map(data.items.map((i) => [i.id, i]));
+    for (const card of document.querySelectorAll("#style-gallery .s-card")) {
+      const item = byId.get(Number(card.dataset.id));
+      if (item) card.querySelector(".badges").innerHTML = badgeHtml(item);
+    }
+    showStyleCounts(data.counts);
+  } catch (_) {}
+}
+
+// ---- selection & removal
+const shownStyleIds = () => [...document.querySelectorAll("#style-gallery .s-card")].map((c) => Number(c.dataset.id));
+
+function pickStyle(id, on, range) {
+  let ids = [id];
+  if (range && sty.lastPicked !== null) { // shift-click: everything between the last pick and this one
+    const shown = shownStyleIds(), a = shown.indexOf(sty.lastPicked), b = shown.indexOf(id);
+    if (a >= 0 && b >= 0) ids = shown.slice(Math.min(a, b), Math.max(a, b) + 1);
+  }
+  for (const i of ids) on ? sty.selected.add(i) : sty.selected.delete(i);
+  sty.lastPicked = id;
+  showStyleSelection();
+}
+
+function showStyleSelection() {
+  for (const card of document.querySelectorAll("#style-gallery .s-card")) {
+    const on = sty.selected.has(Number(card.dataset.id));
+    card.classList.toggle("selected", on);
+    card.querySelector("input").checked = on;
+  }
+  const n = sty.selected.size;
+  const busyHere = !!sty.status?.active && sty.status.character_id === sty.cid;
+  $("style-sel-count").textContent = n ? `${n} selected` : "";
+  $("style-sel-clear").hidden = !n;
+  $("style-sel-remove").disabled = !n || busyHere;
+  $("style-sel-remove").title = busyHere ? "Wait for the running style job to finish." : "";
+}
+
+function clearStyleSelection() { sty.selected.clear(); sty.lastPicked = null; showStyleSelection(); }
+
+async function removeStyleSelection() {
+  const n = sty.selected.size;
+  if (!n || !confirm(`Remove ${plural(n, "image")} from this library?\n\nTheir analyses are deleted too. The files on disk are not touched, and a rescan of the folder will skip them unless you tick "Re-add removed".`)) return;
+  try {
+    const r = await api(styleUrl("/remove"), { method: "POST", body: JSON.stringify({ image_ids: [...sty.selected] }) });
+    $("style-scan-result").textContent = `Removed ${plural(r.removed, "image")}.`;
+    clearStyleSelection();
+    loadStyleGallery(true);
+  } catch (e) { alert(e.message); }
+}
+
+// ---- scan
+async function scanStyleFolder() {
+  const out = $("style-scan-result");
+  const folder = $("style-folder").value.trim();
+  if (!folder) { out.textContent = "Enter or browse to a folder first."; return; }
+  store(folderKey(), folder);
+  out.textContent = "Scanning (hashing every image; a large folder on a slow disk takes a while)…";
+  $("style-scan").disabled = true;
+  try {
+    const r = await api(styleUrl("/scan"), { method: "POST", body: JSON.stringify({ kind: sty.kind, folder, recursive: $("style-recursive").checked, include_removed: $("style-readd").checked }) });
+    $("style-readd").checked = false; // one-shot, so a later rescan doesn't silently undo removals
+    out.textContent = `Found ${r.found}: ${r.added} new, ${r.duplicates} already in this library` +
+      (r.near_duplicates ? `, ${r.near_duplicates} look similar to an existing image` : "") +
+      (r.restored ? `, ${r.restored} previously removed re-added` : "") +
+      (r.skipped_removed ? `, ${r.skipped_removed} previously removed skipped` : "") +
+      (r.unreadable.length ? `, ${r.unreadable.length} unreadable` : "") + ".";
+    loadStyleGallery(true);
+  } catch (e) { out.textContent = e.message; }
+  $("style-scan").disabled = false;
+}
+
+// ---- jobs
+function showStyleError(msg) {
+  sty.localError = !!msg;
+  $("style-run-error").textContent = msg || "";
+  $("style-run-error").hidden = !msg;
+}
+
+async function startStyleRun(reanalyze) {
+  showStyleError("");
+  try {
+    const r = await api(styleUrl("/analyze"), { method: "POST", body: JSON.stringify({ kind: sty.kind, reanalyze }) });
+    if (r.reused) $("style-scan-result").textContent = `${plural(r.reused, "image")} reused an analysis of the same file from another character.`;
+    if (!r.queued) { refreshStyleBadges(); return; }
+  } catch (e) { showStyleError(e.message); return; }
+  pollStyle();
+}
+
+async function writeStyleGuide() {
+  showStyleError("");
+  try { await api(styleUrl("/guides"), { method: "POST", body: JSON.stringify({ kind: sty.kind }) }); }
+  catch (e) { showStyleError(e.message); return; }
+  pollStyle();
+}
+
+function gpuBusyElsewhere() {
+  const j = state.status?.active_job;
+  return !!(j && j.kind !== "vision");
+}
+
+function updateGuideButton() {
+  const active = !!sty.status?.active;
+  $("style-guide").disabled = active || !sty.analyzed || gpuBusyElsewhere();
+  $("style-guide-hint").textContent = !sty.analyzed
+    ? "Analyze some images first; the guide is written from their analyses."
+    : `Written from the ${plural(sty.analyzed, "image")} analyzed with the current model, shaped by the character type, into the character's documents (guides/).`;
+}
+
+function renderStyleStatus(s) {
+  if (!s) return;
+  sty.status = s;
+  const active = !!s.active;
+  const mine = s.character_id === sty.cid && s.kind === sty.kind;
+  const busy = gpuBusyElsewhere();
+  $("style-analyze").disabled = $("style-reanalyze").disabled = active || busy;
+  $("style-cancel").disabled = !active;
+  updateGuideButton();
+  showStyleSelection();
+  const what = s.job === "guide" ? `the ${STYLE_KINDS[s.kind]?.guide || "guide"}` : `${STYLE_KINDS[s.kind] ? (s.kind === "character" ? "character images" : "inspiration images") : "images"}`;
+  let msg = "";
+  const doing = s.job === "prompts" ? "writing image prompts" : `${s.job === "guide" ? "writing " : "analyzing "}${what}`;
+  if (active && !mine) msg = `A local-model job is running (${doing}${s.character_id !== sty.cid ? " for another character" : ""}): ${s.message}. Only one runs at a time.`;
+  else if (mine && s.state !== "idle") msg = s.message + (s.job === "analyze" && s.total ? ` (${s.done}/${s.total}${s.failed ? `, ${s.failed} failed` : ""}${s.reused ? `; ${s.reused} reused` : ""})` : "");
+  else if (busy) msg = "Image generation is using the GPU; style jobs can start when it finishes.";
+  $("style-run-msg").textContent = msg;
+  $("style-run-msg").className = `hint ${mine && s.state === "error" ? "err" : ""}`;
+  const pct = mine && s.total ? Math.round((100 * s.done) / s.total) : 0;
+  $("style-bar").style.width = `${active || s.state === "done" ? pct : 0}%`;
+  $("style-progress-text").textContent = mine && active && s.job === "analyze" && s.total ? `${s.done}/${s.total}` : "";
+  const showErr = mine && !active && !!s.error;
+  if (showErr) { $("style-run-error").textContent = s.error; $("style-run-error").hidden = false; }
+  else if (!sty.localError) $("style-run-error").hidden = true;
+}
+
+async function pollStyle() {
+  if (sty.polling) return;
+  sty.polling = true;
+  let sawActive = false, lastDone = -1;
+  try {
+    while (!$("style").hidden) {
+      const s = await api("/api/style/status");
+      renderStyleStatus(s);
+      const here = s.character_id === sty.cid;
+      sawActive ||= s.active;
+      if (s.active && here && s.kind === sty.kind && s.job === "analyze" && s.done !== lastDone) { lastDone = s.done; refreshStyleBadges(); }
+      if (!s.active) {
+        if (sawActive && here) {
+          await refreshStyleSummary();
+          if (s.kind === sty.kind) { refreshStyleBadges(); loadStyleGuides(); }
+          if (s.job === "guide" && s.state === "done" && s.guide_id) openStyleGuide(s.guide_id);
+        }
+        break;
+      }
+      await sleep(1500);
+    }
+  } catch (e) { $("style-run-msg").textContent = e.message; }
+  sty.polling = false;
+}
+
+// ---- guides
+async function loadStyleGuides() {
+  const forKind = sty.kind, forCid = sty.cid;
+  let items = [];
+  try { items = (await api(`${styleUrl("/guides")}?kind=${forKind}`)).items; } catch (_) {}
+  if (forKind !== sty.kind || forCid !== sty.cid) return;
+  $("style-guides").innerHTML = items.map((g, i) => `
+    <li>
+      <span class="when">${esc(new Date(g.created_at * 1000).toLocaleString())}</span>
+      <span class="hint">${plural(g.image_count, "image")} · ${esc(g.model_label)}${g.character_type ? ` · ${esc(typeInfo(g.character_type)?.label || g.character_type)}` : ""}</span>
+      ${g.truncated ? `<span class="hint warn" title="The model hit its output limit">cut short</span>` : ""}
+      ${i === 0 && g.doc_path ? `<span class="current" title="${esc(g.doc_path)}">current document</span>` : ""}
+      <button class="btn small" data-guide="${g.id}">View</button>
+      ${i === 0 && g.doc_path ? `<button class="btn small" data-guide-doc="${esc(g.doc_path)}">Open in Docs</button>` : ""}
+    </li>`).join("");
+}
+
+// Minimal Markdown -> HTML for the guide viewer. Text is HTML-escaped before any tag is added.
+const mdInline = (s) => esc(s)
+  .replace(/`([^`]+)`/g, "<code>$1</code>")
+  .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+  .replace(/(^|[^*\w])\*([^*\s][^*]*?)\*(?!\w)/g, "$1<em>$2</em>");
+
+function renderMarkdown(md) {
+  const lines = md.replace(/\r/g, "").split("\n");
+  const out = [];
+  let para = [];
+  const flush = () => { if (para.length) out.push(`<p>${para.map(mdInline).join("<br>")}</p>`); para = []; };
+  const LIST = /^\s*([-*+]|\d+[.)])\s+(.*)$/;
+  for (let i = 0; i < lines.length;) {
+    const line = lines[i];
+    let m;
+    if (!line.trim()) { flush(); i++; }
+    else if ((m = line.match(/^(#{1,4})\s+(.*)$/))) { flush(); out.push(`<h${m[1].length}>${mdInline(m[2])}</h${m[1].length}>`); i++; }
+    else if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { flush(); out.push("<hr>"); i++; }
+    else if (line.startsWith(">")) {
+      flush();
+      const quote = [];
+      while (i < lines.length && lines[i].startsWith(">")) quote.push(lines[i++].replace(/^>\s?/, ""));
+      out.push(`<blockquote>${quote.filter((q) => q.trim()).map(mdInline).join("<br>")}</blockquote>`);
+    } else if (line.trim().startsWith("|")) {
+      flush();
+      const rows = [];
+      while (i < lines.length && lines[i].trim().startsWith("|")) rows.push(lines[i++]);
+      const cells = (r) => r.trim().replace(/^\||\|$/g, "").split("|").map((c) => mdInline(c.trim()));
+      const body = rows.filter((r, n) => !(n === 1 && /^[\s|:-]+$/.test(r)));
+      const [head, ...rest] = body;
+      out.push(`<table><thead><tr>${cells(head).map((c) => `<th>${c}</th>`).join("")}</tr></thead><tbody>` +
+        rest.map((r) => `<tr>${cells(r).map((c) => `<td>${c}</td>`).join("")}</tr>`).join("") + "</tbody></table>");
+    } else if ((m = line.match(LIST))) {
+      flush();
+      const ordered = /\d/.test(m[1]);
+      const items = [];
+      while (i < lines.length && (m = lines[i].match(LIST))) { items.push(`<li>${mdInline(m[2])}</li>`); i++; }
+      out.push(ordered ? `<ol>${items.join("")}</ol>` : `<ul>${items.join("")}</ul>`);
+    } else { para.push(line); i++; }
+  }
+  flush();
+  return out.join("\n");
+}
+
+async function openStyleGuide(id) {
+  let g;
+  try { g = await api(`/api/style/guides/${id}`); } catch (e) { alert(e.message); return; }
+  sty.guide = g;
+  $("sg-title").textContent = g.kind === "character" ? "Self-Style Guide" : "Content Guide";
+  $("sg-body").innerHTML = renderMarkdown(g.markdown);
+  $("sg-source").textContent = g.markdown;
+  $("sg-body").hidden = false;
+  $("sg-source").hidden = true;
+  $("sg-raw").textContent = "Show raw";
+  $("sg-copy").textContent = "Copy Markdown";
+  const latest = (await api(`${styleUrl("/guides")}?kind=${g.kind}`).catch(() => ({ items: [] }))).items[0];
+  const current = latest && latest.id === g.id && g.doc_path;
+  $("sg-docs").hidden = !current;
+  $("sg-meta").textContent = `${new Date(g.created_at * 1000).toLocaleString()} · ${plural(g.image_count, "image")}` +
+    (current ? ` · saved as ${g.doc_path}` : " · an earlier version (stored in the database; the file was archived under guides/archive/ when a newer guide was written)");
+  $("style-guide-view").hidden = false;
+}
+
+async function openGuideInDocs(path) {
+  $("style-guide-view").hidden = true;
+  await openDocs({ id: sty.cid, name: sty.name });
+  await loadDoc(path);
+}
+
+// ---- image detail
+const SHORT = 28;
+function describeItem(item) {
+  if (item.description !== undefined) return `${item.color ? item.color + " " : ""}${item.description}${item.category ? ` (${pretty(item.category)})` : ""}`;
+  return Object.values(item).map(pretty).join(", ");
+}
+
+function renderRecord(rec) {
+  const root = h("div");
+  for (const [section, part] of Object.entries(rec)) {
+    if (!part || typeof part !== "object") continue;
+    const chips = h("div", { class: "chips" });
+    const extras = [];
+    for (const [k, v] of Object.entries(part)) {
+      if (typeof v === "string") {
+        if (!v) continue;
+        if (v.length <= SHORT) chips.append(h("span", { class: "chip" }, h("b", {}, pretty(k)), pretty(v)));
+        else extras.push(h("p", {}, h("b", {}, pretty(k) + ": "), v));
+      } else if (Array.isArray(v) && v.length) {
+        if (typeof v[0] === "object") extras.push(h("p", {}, h("b", {}, pretty(k) + ": "), v.map(describeItem).join("; ")));
+        else if (v.every((x) => String(x).length <= SHORT)) extras.push(h("div", { class: "chips" }, v.map((x) => h("span", { class: "chip" }, h("b", {}, pretty(k)), pretty(x)))));
+        else extras.push(h("div", {}, h("b", {}, pretty(k) + ":"), h("ul", {}, v.map((x) => h("li", {}, x)))));
+      }
+    }
+    root.append(h("div", { class: "sect" }, h("h3", {}, pretty(section)), chips, ...extras));
+  }
+  return root;
+}
+
+async function openStyleDetail(id) {
+  let d;
+  try { d = await api(`/api/style/images/${id}`); } catch (e) { alert(e.message); return; }
+  $("style-detail-img").src = `/api/style/images/${id}/file`;
+  const info = $("style-detail-info");
+  info.replaceChildren(h("p", { class: "hint mono" }, d.image.path, ` · ${d.image.width}×${d.image.height}`));
+  const current = d.analyses.find((a) => a.model_label === d.current_model && a.schema_version === d.current_schema_version);
+  const shown = current || d.analyses[0];
+  if (!shown) info.append(h("p", {}, "Not analyzed yet."));
+  else {
+    if (!current) info.append(h("p", { class: "hint" }, "Not analyzed with the current model and schema yet; showing the most recent older result."));
+    info.append(h("p", { class: "hint" }, `${shown.model_label} · schema v${shown.schema_version}` + (shown.seconds ? ` · ${shown.seconds.toFixed(1)}s` : "") +
+      (shown.reused_from ? " · reused from the same file in another character's library" : "")));
+    if (shown.status === "ok") {
+      info.append(renderRecord(shown.record));
+      info.append(h("details", {}, h("summary", { class: "hint" }, "Raw JSON"), h("pre", { class: "pre-box" }, JSON.stringify(shown.record, null, 2))));
+    } else {
+      info.append(h("pre", { class: "pre-box err" }, shown.error || "Failed."));
+      if (shown.raw_text) info.append(h("details", {}, h("summary", { class: "hint" }, "Raw model output"), h("pre", { class: "pre-box" }, shown.raw_text)));
+    }
+  }
+  $("style-detail").hidden = false;
+}
+
+async function saveStyleType() {
+  const id = $("style-type").value;
+  $("style-type-desc").textContent = typeDescription(id);
+  try {
+    await api(`/api/characters/${sty.cid}`, { method: "PUT", body: JSON.stringify({ character_type: id }) });
+    $("style-type-msg").textContent = "Saved.";
+    $("style-type-msg").className = "hint ok";
+  } catch (e) { $("style-type-msg").textContent = e.message; $("style-type-msg").className = "hint err"; }
+}
+
+function wireStyle() {
+  $("char-style").addEventListener("click", () => { const c = selectedCharacter(); if (c) openStyle(c); });
+  $("style-active-char").addEventListener("click", () => { const c = activeCharacter(); if (c) openStyle(c); });
+  $("style-close").addEventListener("click", closeStyle);
+  document.querySelectorAll("#style .tab").forEach((t) => t.addEventListener("click", () => { if (t.dataset.kind !== sty.kind) showStyleKind(t.dataset.kind); }));
+  $("style-settings").addEventListener("click", () => openSettings("vision"));
+  $("style-problems").addEventListener("click", (ev) => { if (ev.target.id === "style-fix") openSettings("vision"); });
+  $("style-type").addEventListener("change", saveStyleType);
+  $("style-folder").addEventListener("change", () => store(folderKey(), $("style-folder").value.trim()));
+  $("style-browse").addEventListener("click", () => {
+    const cur = $("style-folder").value.trim();
+    browse("style_folder", "dir", cur, (p) => { $("style-folder").value = p; store(folderKey(), p); });
+  });
+  $("style-scan").addEventListener("click", scanStyleFolder);
+  $("style-analyze").addEventListener("click", () => startStyleRun(false));
+  $("style-reanalyze").addEventListener("click", () => {
+    if (confirm(`Re-run the analysis for every image in this library with the current model?`)) startStyleRun(true);
+  });
+  $("style-cancel").addEventListener("click", () => api("/api/style/cancel", { method: "POST" }).catch(() => {}));
+  $("style-guide").addEventListener("click", writeStyleGuide);
+  $("style-log").addEventListener("click", async () => {
+    const pre = $("style-log-text");
+    if (!pre.hidden) { pre.hidden = true; return; }
+    try { pre.textContent = (await api("/api/style/server-log")).log || "(no log yet: the vision model has not been started)"; } catch (e) { pre.textContent = e.message; }
+    pre.hidden = false;
+  });
+  document.querySelectorAll("#style .filter").forEach((b) => b.addEventListener("click", () => {
+    document.querySelectorAll("#style .filter").forEach((x) => x.classList.toggle("active", x === b));
+    sty.filter = b.dataset.status;
+    clearStyleSelection();
+    loadStyleGallery(true);
+  }));
+  $("style-more").addEventListener("click", () => loadStyleGallery(false));
+  $("style-gallery").addEventListener("click", (ev) => {
+    const card = ev.target.closest(".s-card");
+    if (!card) return;
+    const id = Number(card.dataset.id);
+    if (ev.target.matches("input[type=checkbox]")) pickStyle(id, ev.target.checked, ev.shiftKey);
+    else if (ev.target.closest(".open")) openStyleDetail(id);
+  });
+  $("style-sel-all").addEventListener("click", () => { shownStyleIds().forEach((i) => sty.selected.add(i)); showStyleSelection(); });
+  $("style-sel-clear").addEventListener("click", clearStyleSelection);
+  $("style-sel-remove").addEventListener("click", removeStyleSelection);
+  $("style-guides").addEventListener("click", (ev) => {
+    const t = ev.target;
+    if (t.dataset.guide) openStyleGuide(Number(t.dataset.guide));
+    if (t.dataset.guideDoc) openGuideInDocs(t.dataset.guideDoc);
+  });
+  $("style-detail-close").addEventListener("click", () => { $("style-detail").hidden = true; });
+  $("sg-close").addEventListener("click", () => { $("style-guide-view").hidden = true; });
+  $("sg-raw").addEventListener("click", () => {
+    const raw = $("sg-source").hidden;
+    $("sg-source").hidden = !raw;
+    $("sg-body").hidden = raw;
+    $("sg-raw").textContent = raw ? "Show formatted" : "Show raw";
+  });
+  $("sg-copy").addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(sty.guide?.markdown || ""); $("sg-copy").textContent = "Copied"; }
+    catch (_) { $("sg-copy").textContent = "Copy failed"; }
+  });
+  $("sg-docs").addEventListener("click", () => { if (sty.guide?.doc_path) openGuideInDocs(sty.guide.doc_path); });
+  $("ce-type").addEventListener("change", () => { $("ce-type-desc").textContent = typeDescription($("ce-type").value); });
+  $("vision-fields").addEventListener("click", (ev) => {
+    const t = ev.target;
+    if (!t.dataset.vbrowse) return;
+    const input = document.querySelector(`[data-vision="${t.dataset.vbrowse}"]`);
+    const cur = input.value.trim();
+    browse(`vision_${t.dataset.vbrowse}`, "file", cur ? cur.replace(/[\\/][^\\/]*$/, "") : "", (p) => { input.value = p; }, t.dataset.ext);
+  });
+}
+
+// ------------------------------------------------------------------------------------ prompts from guides
+// The local model (Settings → Style analysis) writes prompts from the active character's guides/ documents.
+// The job runs on the GPU worker; its result arrives in /api/status → style.prompts (watched by pollStatus).
+const gp = { cid: null, prompts: [], used: -1, waiting: false };
+
+function setGpMsg(text, cls = "") { $("gp-msg").textContent = text; $("gp-msg").className = `hint ${cls}`; }
+
+function drawGuidePrompts() {
+  $("gp-list").innerHTML = gp.prompts.map((p, i) =>
+    `<li class="${i === gp.used ? "used" : ""}"><span>${esc(p)}</span><button class="btn small" data-gp="${i}">Use</button></li>`).join("");
+}
+
+function renderGuidePrompts() {
+  const c = activeCharacter();
+  $("gp").hidden = !c;
+  if (!c) return;
+  if (gp.cid !== c.id) { // switched character: show that character's last prompts
+    gp.cid = c.id;
+    gp.waiting = false;
+    gp.used = -1;
+    try { gp.prompts = JSON.parse(recall(`gp:${c.id}`) || "[]"); } catch (_) { gp.prompts = []; }
+    drawGuidePrompts();
+    setGpMsg("");
+  }
+  const s = state.status?.style;
+  const mine = !!s && s.job === "prompts" && s.character_id === c.id;
+  const active = !!s?.active;
+  $("gp-write").disabled = active || !!state.status?.busy;
+  $("gp-cancel").hidden = !(mine && active);
+  if (mine && active) { gp.waiting = true; setGpMsg(s.message); return; }
+  if (!gp.waiting || !mine) return;
+  gp.waiting = false; // the job we started (or saw running) has finished
+  if (s.state === "done" && s.prompts?.length) {
+    gp.prompts = s.prompts;
+    gp.used = -1;
+    store(`gp:${c.id}`, JSON.stringify(gp.prompts));
+    drawGuidePrompts();
+    setGpMsg(`${s.message} Pick one to use it.`, "ok");
+  } else if (s.state === "error") setGpMsg(`${s.message} ${s.error || ""}`.trim(), "err");
+  else if (s.state === "cancelled") setGpMsg("Cancelled.");
+}
+
+async function writeGuidePrompts() {
+  const c = activeCharacter();
+  if (!c) return;
+  setGpMsg("Starting…");
+  $("gp-write").disabled = true;
+  try {
+    const r = await api(`/api/characters/${c.id}/prompts`, { method: "POST",
+      body: JSON.stringify({ idea: $("gp-idea").value, count: Number($("gp-count").value) }) });
+    gp.waiting = true;
+    setGpMsg(`Queued (from ${r.guides.map((g) => g.replace(/^guides\//, "")).join(" + ")})…`);
+  } catch (e) {
+    setGpMsg(e.message, "err");
+    $("gp-write").disabled = false;
+  }
+}
+
+function useGuidePrompt(i) {
+  const p = gp.prompts[i];
+  if (p === undefined) return;
+  $("prompt").value = p;
+  store("prompt", p);
+  gp.used = i;
+  drawGuidePrompts();
+  updateControls();
+}
+
+function wireGuidePrompts() {
+  $("gp-write").addEventListener("click", writeGuidePrompts);
+  $("gp-cancel").addEventListener("click", () => api("/api/style/cancel", { method: "POST" }).catch(() => {}));
+  $("gp-list").addEventListener("click", (ev) => { const b = ev.target.closest("[data-gp]"); if (b) useGuidePrompt(Number(b.dataset.gp)); });
+  $("gp-idea").value = recall("gpIdea") || "";
+  $("gp-idea").addEventListener("input", () => store("gpIdea", $("gp-idea").value));
+  $("gp-idea").addEventListener("keydown", (ev) => { if (ev.key === "Enter" && !$("gp-write").disabled) writeGuidePrompts(); });
+  const n = recall("gpCount");
+  if (n) $("gp-count").value = n;
+  $("gp-count").addEventListener("change", () => store("gpCount", $("gp-count").value));
+}
+
 // ------------------------------------------------------------------------------------ wiring
 function wire() {
   const saved = recall("prompt");
@@ -977,12 +1662,18 @@ function wire() {
   wireLoras();
   wireCharacters();
   wireDocs();
+  wireStyle();
+  wireGuidePrompts();
   document.addEventListener("keydown", (ev) => {
     if (ev.key !== "Escape") return;
-    if (!$("browser").hidden) { $("browser").hidden = true; return; } // the browser can sit on top of the editor
+    // close the topmost dialog only
+    if (!$("browser").hidden) { $("browser").hidden = true; return; }
+    if (!$("char-editor").hidden) { $("char-editor").hidden = true; return; }
+    if (!$("settings").hidden) { $("settings").hidden = true; return; }
     if (!$("docs").hidden) { closeDocs(); return; }
-    $("settings").hidden = true;
-    $("char-editor").hidden = true;
+    if (!$("style-guide-view").hidden) { $("style-guide-view").hidden = true; return; }
+    if (!$("style-detail").hidden) { $("style-detail").hidden = true; return; }
+    if (!$("style").hidden) closeStyle();
   });
 }
 
